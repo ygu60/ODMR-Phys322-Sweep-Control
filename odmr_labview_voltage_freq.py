@@ -4,7 +4,12 @@ normalization.
 
 Reads the raw per-sample traces exported by odmr_labview_replica.py
 (--save-traces -> odmr_labview_replica_traces.csv, columns run_index,
-time_s, ch1_V, ch2_V) and, for each sweep:
+time_s, ch1_V, ch2_V). Sweeps can optionally be filtered out before
+averaging: --min-diff-mv excludes sweeps whose overall CH1 max-min range is
+too small (probably no visible feature), while --max-jump-mv excludes
+sweeps with an irregular single-sample spike/glitch (a jump between
+adjacent samples larger than the threshold, as distinct from a broad
+max-min range). For each remaining sweep:
 
   1. Convert CH2 (VCO tuning voltage) to frequency directly - voltage, not
      time, is the independent variable here, since CH2 is the actual
@@ -17,14 +22,21 @@ time_s, ch1_V, ch2_V) and, for each sweep:
      voltage-to-frequency mapping non-monotonic within a sweep.
   2. Interpolate that sweep's CH1 (detector) signal onto a common frequency
      grid.
+  3. Normalize per-run (--normalize-per-run, on by default): rescale the
+     sweep so its own mean maps to 1 - intensity(f) becomes
+     1 + (intensity(f) - mean)/|mean| - so sweep-to-sweep gain/offset
+     drift (e.g. laser RIN) doesn't bias the average computed next. Mean,
+     not max, is used as the per-sweep reference since max is sensitive to
+     a single noisy sample.
 
 Then, across all sweeps:
 
   2. Average: I(f) = (1/N) * sum_i I_i(f), with per-frequency standard
      deviation as well.
-  3. Normalize: contrast(f) = 100 * (I(f) - I_max) / I_max, where I_max is
+  3. Normalize: contrast(f) = 100 * (I(f) - I_max) / |I_max|, where I_max is
      the averaged curve's own maximum (assumed off-resonance baseline), so
-     the baseline reads as 0% and the resonance dip reads as %-below-baseline.
+     the baseline reads as 0% and the resonance dip reads as %-below-baseline
+     regardless of whether the detector signal itself is positive or negative.
 
 Requires: pip install numpy matplotlib
 
@@ -60,10 +72,17 @@ OUTPUT_PNG = os.path.join(PNG_DIR, "odmr_labview_voltage_freq.png")
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", default=DEFAULT_INPUT_CSV, help="Raw traces CSV from odmr_labview_replica.py --save-traces.")
-    p.add_argument("--grid-points", type=int, default=500, help="Number of points in the common frequency grid.")
+    p.add_argument("--grid-points", type=int, default=1953, help="Number of points in the common frequency grid.")
     p.add_argument("--min-diff-mv", type=float, default=None,
                    help="Only include sweeps whose CH1 max-min difference exceeds this threshold (mV) - "
                         "same quality filter as odmr_labview_replica.py's --min-diff-mv. Unset: use all sweeps.")
+    p.add_argument("--max-jump-mv", type=float, default=30,
+                   help="Exclude sweeps with a single-sample-to-sample CH1 jump larger than this (mV) - "
+                        "filters out irregular spiking/glitches, as distinct from --min-diff-mv's broad "
+                        "max-min range. Unset: no spike filtering.")
+    p.add_argument("--normalize-per-run", action=argparse.BooleanOptionalAction, default=False,
+                   help="Rescale each sweep to its own mean before averaging, so sweep-to-sweep "
+                        "gain/offset drift (e.g. laser RIN) doesn't bias the average (default: on).")
     return p.parse_args()
 
 
@@ -100,15 +119,21 @@ def main():
     print(f"Loaded {n_loaded} sweeps from {args.input}")
 
     output_csv, output_png = OUTPUT_CSV, OUTPUT_PNG
-    if args.min_diff_mv is not None:
-        sweeps = {
-            run_idx: (ch1_v, ch2_v)
-            for run_idx, (ch1_v, ch2_v) in sweeps.items()
-            if (np.max(ch1_v) - np.min(ch1_v)) * 1e3 > args.min_diff_mv
-        }
-        print(f"Kept {len(sweeps)}/{n_loaded} sweeps with CH1 diff > {args.min_diff_mv:.0f} mV")
+    if args.min_diff_mv is not None or args.max_jump_mv is not None:
+        kept = {}
+        for run_idx, (ch1_v, ch2_v) in sweeps.items():
+            if args.min_diff_mv is not None and (np.max(ch1_v) - np.min(ch1_v)) * 1e3 <= args.min_diff_mv:
+                continue
+            if args.max_jump_mv is not None and np.max(np.abs(np.diff(ch1_v))) * 1e3 > args.max_jump_mv:
+                continue
+            kept[run_idx] = (ch1_v, ch2_v)
+        sweeps = kept
+        print(
+            f"Kept {len(sweeps)}/{n_loaded} sweeps "
+            f"(min_diff_mv={args.min_diff_mv}, max_jump_mv={args.max_jump_mv})"
+        )
         if not sweeps:
-            raise SystemExit("No sweeps passed the --min-diff-mv filter - nothing to average.")
+            raise SystemExit("No sweeps passed the filters - nothing to average.")
         root, ext = os.path.splitext(OUTPUT_CSV)
         output_csv = f"{root}_filtered{ext}"
         root, ext = os.path.splitext(OUTPUT_PNG)
@@ -121,8 +146,22 @@ def main():
     for ch1_v, ch2_v in sweeps.values():
         freq_ghz = V_TO_F_SLOPE_GHZ_PER_V * ch2_v + V_TO_F_INTERCEPT_GHZ
         order = np.argsort(freq_ghz)
+        intensity = ch1_v[order]
+
+        if args.normalize_per_run:
+            # Rescale this sweep to its own mean, so its typical level maps
+            # to 1 regardless of that sweep's absolute gain/offset. Mean
+            # (not max) as the baseline reference, since max is sensitive to
+            # a single noisy sample - whatever that sweep's largest noise
+            # spike happens to be - while mean is far more robust (same
+            # convention as odmr_averaged_sweep.py's deviation-from-mean).
+            # abs() in the denominator keeps a dip reading as "below 1" even
+            # if the sweep's baseline is negative.
+            baseline = np.mean(intensity)
+            intensity = 1.0 + (intensity - baseline) / abs(baseline) if baseline else np.zeros_like(intensity)
+
         sweep_freqs.append(freq_ghz[order])
-        sweep_intensities.append(ch1_v[order])
+        sweep_intensities.append(intensity)
 
     # Common frequency grid: the intersection of all sweeps' frequency
     # ranges, so every grid point can be interpolated without extrapolating.
@@ -140,28 +179,46 @@ def main():
     i_avg = np.mean(interpolated, axis=0)
     i_sd = np.std(interpolated, axis=0)
     i_max = np.max(i_avg)
-    contrast_pct = 100.0 * (i_avg - i_max) / i_max if i_max else np.zeros_like(i_avg)
+    # Divide by abs(i_max), not i_max, so the sign convention (0% at
+    # baseline, negative % at a dip) holds even when the detector signal
+    # itself is negative-going.
+    contrast_pct = 100.0 * (i_avg - i_max) / abs(i_max) if i_max else np.zeros_like(i_avg)
+
+    # Relative noise: SD as a percentage of the local mean. If this stays
+    # roughly flat through the dip, the dip's noise is scaling down along
+    # with its signal (shot noise / laser RIN, etc.) - evidence the dip is a
+    # real reduction in signal rather than an unrelated measurement artifact.
+    relative_noise_pct = 100.0 * i_sd / np.abs(i_avg)
+
+    avg_col = "detector_norm_avg" if args.normalize_per_run else "detector_V_avg"
+    sd_col = "detector_norm_sd" if args.normalize_per_run else "detector_V_sd"
+    avg_unit = "ratio to per-run baseline" if args.normalize_per_run else "V"
 
     with open(output_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["freq_GHz", "detector_V_avg", "detector_V_sd", "contrast_pct"])
-        for fq, avg, sd, c in zip(freq_grid, i_avg, i_sd, contrast_pct):
-            writer.writerow([fq, avg, sd, c])
+        writer.writerow(["freq_GHz", avg_col, sd_col, "contrast_pct", "relative_noise_pct"])
+        for fq, avg, sd, c, rn in zip(freq_grid, i_avg, i_sd, contrast_pct, relative_noise_pct):
+            writer.writerow([fq, avg, sd, c, rn])
     print(f"Saved averaged, voltage-derived spectrum to {output_csv}")
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 11), sharex=True)
 
     ax1.plot(freq_grid, i_avg, linewidth=1)
     ax1.fill_between(freq_grid, i_avg - i_sd, i_avg + i_sd, alpha=0.25)
-    ax1.set_ylabel("Detector output (V)")
-    ax1.set_title(f"Averaged detector response vs. drive frequency (N={len(sweeps)} sweeps)")
+    ax1.set_ylabel(f"Detector output ({avg_unit})")
+    title_suffix = ", per-run normalized" if args.normalize_per_run else ""
+    ax1.set_title(f"Averaged detector response vs. drive frequency (N={len(sweeps)} sweeps{title_suffix})")
     ax1.grid(True, alpha=0.3)
 
     ax2.plot(freq_grid, contrast_pct, linewidth=1)
     ax2.axhline(0, color="black", linewidth=0.5, alpha=0.5)
-    ax2.set_xlabel("Microwave drive frequency (GHz)")
     ax2.set_ylabel("Contrast vs. baseline max (%)")
     ax2.grid(True, alpha=0.3)
+
+    ax3.plot(freq_grid, relative_noise_pct, linewidth=1)
+    ax3.set_xlabel("Microwave drive frequency (GHz)")
+    ax3.set_ylabel("Relative noise, SD/|mean| (%)")
+    ax3.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(output_png, dpi=150)
@@ -169,7 +226,7 @@ def main():
 
     dip_idx = np.argmin(contrast_pct)
     print(
-        f"\nBaseline (max) detector level: {i_max:.5f} V\n"
+        f"\nBaseline (max) detector level: {i_max:.5f} {avg_unit}\n"
         f"Deepest dip: {contrast_pct[dip_idx]:.2f}% below baseline at {freq_grid[dip_idx]:.4f} GHz"
     )
 

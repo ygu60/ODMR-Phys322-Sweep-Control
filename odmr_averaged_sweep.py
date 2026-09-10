@@ -240,7 +240,9 @@ def main():
     # Deviation from the mean, as a percentage of the mean, so the dip shows
     # up as a negative excursion around zero regardless of absolute signal level.
     mean_v1 = np.mean(avg_v1)
-    dev_pct_v1 = 100 * (avg_v1 - mean_v1) / mean_v1 if mean_v1 else np.zeros_like(avg_v1)
+    # Divide by abs(mean_v1), not mean_v1, so a dip still reads as a
+    # negative percentage even if the detector's mean level is negative.
+    dev_pct_v1 = 100 * (avg_v1 - mean_v1) / abs(mean_v1) if mean_v1 else np.zeros_like(avg_v1)
 
     # Save raw + percent-deviation-from-mean averaged data for the lab report.
     with open(OUTPUT_CSV, "w", newline="") as f:

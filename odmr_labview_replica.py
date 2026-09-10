@@ -16,31 +16,28 @@ and 10):
 
   - Data-processing block (Fig. 10): for each run, records that waveform's
     max and min ("Average Max" / "Average Minimum" boxes acting on the
-    current run), then across all runs computes the point-by-point average
-    and standard-deviation curves ("All runs + Average and SD curves"), a
-    histogram of the per-run max-min differences ("Create Histogram"), and
-    the overall Average Max 2 / Average Minimum 2 / Difference (mV) /
-    Percent Diff.
+    current run), then across all runs computes the overall Average Max 2 /
+    Average Minimum 2 / Difference (mV) / Percent Diff.
 
 Unlike odmr_averaged_sweep.py (which is hardwired to the sawtooth-driven
 ODMR frequency sweep), this script is a generic single-channel-of-interest
 contrast measurement: point it at CHAN1 for any max/min-style measurement
 and it captures/reports the same statistics as the VI.
 
-Not replicated: the VI's live front-panel graphs update after every run; this
-script prints per-run progress to the console and only draws plots once
-acquisition is complete. "Serial Configuration" (VISA resource setup) is
-handled transparently by pyvisa and has no separate control here.
+Not replicated: the VI's live front-panel graphs update after every run, and
+the "All runs + Average and SD curves" / "Create Histogram" plots - this
+script is CSV-output only and prints per-run progress to the console.
+"Serial Configuration" (VISA resource setup) is handled transparently by
+pyvisa and has no separate control here.
 
 Pass --save-traces to additionally dump every run's raw per-sample CH1/CH2
 voltages to csv_output/odmr_labview_replica_traces.csv - odmr_labview_voltage_freq.py
 consumes that file to convert each sweep's CH2 tuning voltage to frequency
 and average the sweeps on a common frequency grid.
 
-All CSV output goes to csv_output/, all PNG output to png_output/ (created
-automatically if missing).
+All CSV output goes to csv_output/ (created automatically if missing).
 
-Requires: pip install pyvisa pyvisa-py numpy matplotlib
+Requires: pip install pyvisa pyvisa-py numpy
 
 Usage:
   python odmr_labview_replica.py --runs 100 --waveform ramp --freq-hz 100 --ampl-vpp 1.5 --offset-v 4.0 --ch2-enabled
@@ -51,24 +48,23 @@ import csv
 import os
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pyvisa
 
 DEFAULT_SCOPE_ADDR = "USB0::0x2A8D::0x0396::CN63257664::0::INSTR"
 DEFAULT_AWG_ADDR = "GPIB0::5::INSTR"
 
-# --- Output folders ---
+# --- Output folder ---
 CSV_DIR = "csv_output"
-PNG_DIR = "png_output"
 
 OUTPUT_CSV = os.path.join(CSV_DIR, "odmr_labview_replica.csv")
 OUTPUT_TRACES_CSV = os.path.join(CSV_DIR, "odmr_labview_replica_traces.csv")
-OUTPUT_FILTERED_AVG_CSV = os.path.join(CSV_DIR, "odmr_labview_replica_filtered_avg.csv")
-OUTPUT_WAVEFORM_PNG = os.path.join(PNG_DIR, "odmr_labview_replica_waveforms.png")
-OUTPUT_HISTOGRAM_PNG = os.path.join(PNG_DIR, "odmr_labview_replica_histogram.png")
 
 TIMEOUT_MS = 5000
+
+# Capture slightly less than one full ramp period - same rationale as
+# odmr_averaged_sweep.py's CAPTURE_FRACTION_OF_PERIOD.
+CAPTURE_FRACTION_OF_PERIOD = 0.93
 
 
 def parse_args():
@@ -88,7 +84,10 @@ def parse_args():
     fg.add_argument("--no-reset", dest="reset_awg", action="store_false")
     fg.add_argument("--waveform", choices=["sine", "ramp"], default="ramp",
                      help="1=Sine, 4=Ramp in the VI's waveform selector.")
-    fg.add_argument("--freq-hz", type=float, default=100.0)
+    fg.add_argument("--freq-hz", type=float, default=20.0,
+                     help="Sawtooth sweep rate (default: 20 Hz, slowed from an earlier 100 Hz default "
+                          "to give the VCO/detector more time per frequency step to settle, reducing "
+                          "dynamic distortion of the resonance dip).")
     fg.add_argument("--ampl-vpp", type=float, default=1.5)
     fg.add_argument("--offset-v", type=float, default=4.0, help="DC offset, at center.")
     fg.add_argument("--ramp-symmetry-pct", type=float, default=100.0,
@@ -113,8 +112,14 @@ def parse_args():
 
     acq = p.add_argument_group("Acquisition / trigger")
     acq.add_argument("--acquisition-type", choices=["sample", "average", "hresolution", "peak"], default="sample")
-    acq.add_argument("--time-per-record-s", type=float, default=0.01, help="Timebase full-record span, seconds.")
-    acq.add_argument("--min-record-length", type=int, default=2000, help="Points per acquisition.")
+    acq.add_argument("--time-per-record-s", type=float, default=None,
+                      help="Timebase full-record span, seconds. Unset: derived from --freq-hz as "
+                           f"{CAPTURE_FRACTION_OF_PERIOD}/freq_hz, i.e. slightly less than one full "
+                           "ramp period (capturing exactly one period risks running past the ramp's "
+                           "reset into the next cycle's leading edge).")
+    acq.add_argument("--min-record-length", type=int, default=10000,
+                      help="Points per acquisition (default: 10000, raised from an earlier 2000 default "
+                           "for finer frequency resolution across the same swept span).")
     acq.add_argument("--trigger-source", choices=["CHAN1", "CHAN2"], default="CHAN1")
     acq.add_argument("--trigger-level-v", type=float, default=0.0)
     acq.add_argument("--trigger-slope", choices=["positive", "negative"], default="negative")
@@ -123,12 +128,11 @@ def parse_args():
     acq.add_argument("--save-traces", action="store_true", default=False,
                       help="Also save raw per-sample traces (time_s, chN_V per run) to "
                            f"{OUTPUT_TRACES_CSV}, e.g. for voltage-to-frequency sweep averaging downstream.")
-    acq.add_argument("--min-diff-mv", type=float, default=80.0,
-                      help="In addition to the all-runs average, also average just the runs whose "
-                           "CH1 max-min difference exceeds this threshold (mV) - e.g. to isolate "
-                           "sweeps with a visible resonance dip from noisy/flat ones (default: 80).")
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.time_per_record_s is None:
+        args.time_per_record_s = CAPTURE_FRACTION_OF_PERIOD / args.freq_hz
+    return args
 
 
 ACQ_TYPE_SCPI = {
@@ -249,7 +253,6 @@ def main():
     args = parse_args()
 
     os.makedirs(CSV_DIR, exist_ok=True)
-    os.makedirs(PNG_DIR, exist_ok=True)
 
     channels = []
     if args.ch1_enabled:
@@ -321,25 +324,14 @@ def main():
     run_min = np.array(run_min[:n_captured])
     run_diff_mv = (run_max - run_min) * 1e3
 
-    avg = {ch: np.mean(np.array(traces[ch][:n_captured]), axis=0) for ch in channels}
-    sd = {ch: np.std(np.array(traces[ch][:n_captured]), axis=0) for ch in channels}
-
-    # Average of just the runs whose CH1 max-min difference clears the
-    # threshold - e.g. to isolate sweeps with a visible resonance dip.
-    good_mask = run_diff_mv > args.min_diff_mv
-    n_good = int(np.sum(good_mask))
-    if n_good > 0:
-        filtered_avg = {ch: np.mean(np.array(traces[ch][:n_captured])[good_mask], axis=0) for ch in channels}
-        filtered_sd = {ch: np.std(np.array(traces[ch][:n_captured])[good_mask], axis=0) for ch in channels}
-    else:
-        filtered_avg = filtered_sd = None
-
     # "Average Max 2" / "Average Minimum 2" / "Difference (mV)" / "Percent Diff":
     # the per-run max/min values, averaged across all runs.
     avg_max_2 = float(np.mean(run_max))
     avg_min_2 = float(np.mean(run_min))
     difference_mv = (avg_max_2 - avg_min_2) * 1e3
-    percent_diff = 100.0 * difference_mv / (avg_max_2 * 1e3) if avg_max_2 else float("nan")
+    # abs() so Percent Diff stays a positive fraction of the signal's scale
+    # even if the detector's baseline (avg_max_2) is negative-going.
+    percent_diff = 100.0 * difference_mv / abs(avg_max_2 * 1e3) if avg_max_2 else float("nan")
 
     with open(OUTPUT_CSV, "w", newline="") as f:
         writer = csv.writer(f)
@@ -357,64 +349,12 @@ def main():
                     writer.writerow([i, t] + [traces[ch][i][j] for ch in channels])
         print(f"Saved raw per-sample traces to {OUTPUT_TRACES_CSV}")
 
-    if filtered_avg is not None:
-        with open(OUTPUT_FILTERED_AVG_CSV, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["time_s"] + [f"ch{ch}_V_avg" for ch in channels] + [f"ch{ch}_V_sd" for ch in channels])
-            for j, t in enumerate(t_ref):
-                writer.writerow(
-                    [t] + [filtered_avg[ch][j] for ch in channels] + [filtered_sd[ch][j] for ch in channels]
-                )
-        print(
-            f"Saved average of {n_good}/{n_captured} runs with diff_mV > {args.min_diff_mv:.0f} "
-            f"to {OUTPUT_FILTERED_AVG_CSV}"
-        )
-    else:
-        print(f"No runs had diff_mV > {args.min_diff_mv:.0f} - filtered average skipped.")
-
-    # "All runs + Average and SD curves" (Fig. 10)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for ch in channels:
-        for v in traces[ch][:n_captured]:
-            ax.plot(t_ref, v, color="gray", alpha=0.15, linewidth=0.5)
-        ax.plot(t_ref, avg[ch], linewidth=1.5, label=f"CHAN{ch} average (N={n_captured})")
-        ax.fill_between(t_ref, avg[ch] - sd[ch], avg[ch] + sd[ch], alpha=0.25, label=f"CHAN{ch} ± SD")
-        if filtered_avg is not None:
-            ax.plot(
-                t_ref, filtered_avg[ch], linewidth=1.5, linestyle="--",
-                label=f"CHAN{ch} average, diff_mV > {args.min_diff_mv:.0f} (N={n_good})",
-            )
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Voltage (V)")
-    ax.set_title(f"All runs + average and SD curves (N={n_captured})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(OUTPUT_WAVEFORM_PNG, dpi=150)
-    print(f"Saved waveform plot to {OUTPUT_WAVEFORM_PNG}")
-
-    # "Create Histogram" of the per-run max-min difference
-    fig2, ax2 = plt.subplots(figsize=(7, 5))
-    ax2.hist(run_diff_mv, bins=30)
-    ax2.axvline(args.min_diff_mv, color="red", linestyle="--", label=f"{args.min_diff_mv:.0f} mV threshold")
-    ax2.set_xlabel("Diff (mV)")
-    ax2.set_ylabel("Count")
-    ax2.set_title(f"Histogram of per-run max-min difference (N={n_captured})")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    fig2.tight_layout()
-    fig2.savefig(OUTPUT_HISTOGRAM_PNG, dpi=150)
-    print(f"Saved histogram to {OUTPUT_HISTOGRAM_PNG}")
-
     print(
         f"\nAverage Max 2:  {avg_max_2:.5f} V\n"
         f"Average Min 2:  {avg_min_2:.5f} V\n"
         f"Difference:     {difference_mv:.3f} mV\n"
-        f"Percent Diff:   {percent_diff:.2f} %\n"
-        f"Runs with diff_mV > {args.min_diff_mv:.0f}: {n_good}/{n_captured}"
+        f"Percent Diff:   {percent_diff:.2f} %"
     )
-
-    plt.show()
 
 
 if __name__ == "__main__":
