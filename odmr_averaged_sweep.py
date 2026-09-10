@@ -23,10 +23,15 @@ Usage:
 """
 
 import csv
+import os
 import time
 import numpy as np
 import pyvisa
 import matplotlib.pyplot as plt
+
+# --- Output folders ---
+CSV_DIR = "csv_output"
+PNG_DIR = "png_output"
 
 # --- Instrument addresses ---
 SCOPE_ADDR = "USB0::0x2A8D::0x0396::CN63257664::0::INSTR"
@@ -68,8 +73,8 @@ TRIGGER_LEVEL_V = RAMP_VMIN
 
 TIMEOUT_MS = 5000
 
-OUTPUT_CSV = "odmr_averaged_sweep.csv"
-OUTPUT_PNG = "odmr_averaged_sweep.png"
+OUTPUT_CSV = os.path.join(CSV_DIR, "odmr_averaged_sweep.csv")
+OUTPUT_PNG = os.path.join(PNG_DIR, "odmr_averaged_sweep.png")
 
 
 def setup_awg(inst):
@@ -160,6 +165,9 @@ def acquire_single_sweep(inst):
 
 
 def main():
+    os.makedirs(CSV_DIR, exist_ok=True)
+    os.makedirs(PNG_DIR, exist_ok=True)
+
     rm = pyvisa.ResourceManager()
     scope = rm.open_resource(SCOPE_ADDR)
     scope.timeout = TIMEOUT_MS
@@ -229,37 +237,35 @@ def main():
     v_tune_fit = ramp_slope * t_ref + ramp_intercept
     freq_ghz = V_TO_F_SLOPE_GHZ_PER_V * v_tune_fit + V_TO_F_INTERCEPT_GHZ
 
-    # Deviation from the mean: subtract the averaged trace's own mean level
-    # so the dip shows up as a negative excursion around zero.
+    # Deviation from the mean, as a percentage of the mean, so the dip shows
+    # up as a negative excursion around zero regardless of absolute signal level.
     mean_v1 = np.mean(avg_v1)
-    dev_v1 = avg_v1 - mean_v1
+    dev_pct_v1 = 100 * (avg_v1 - mean_v1) / mean_v1 if mean_v1 else np.zeros_like(avg_v1)
 
-    # Save raw + deviation-from-mean averaged data for the lab report.
+    # Save raw + percent-deviation-from-mean averaged data for the lab report.
     with open(OUTPUT_CSV, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["time_s", "v_tune_V", "freq_GHz", "detector_V", "detector_V_dev_from_mean"])
-        for t, vt, fq, vd, dv in zip(t_ref, avg_v2, freq_ghz, avg_v1, dev_v1):
+        writer.writerow(["time_s", "v_tune_V", "freq_GHz", "detector_V", "detector_pct_dev_from_mean"])
+        for t, vt, fq, vd, dv in zip(t_ref, avg_v2, freq_ghz, avg_v1, dev_pct_v1):
             writer.writerow([t, vt, fq, vd, dv])
     print(f"\nSaved averaged data to {OUTPUT_CSV}")
 
-    # Plot detector output's deviation from its mean vs. drive frequency - look for the resonance dip.
+    # Plot detector output's percent deviation from its mean vs. drive frequency - look for the resonance dip.
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(freq_ghz, dev_v1, linewidth=1)
+    ax.plot(freq_ghz, dev_pct_v1, linewidth=1)
     ax.axhline(0, color="black", linewidth=0.5, alpha=0.5)
     ax.set_xlabel("Microwave drive frequency (GHz)")
-    ax.set_ylabel("Detector output, deviation from mean (V)")
+    ax.set_ylabel("Detector output, deviation from mean (%)")
     ax.set_title(f"Detector response deviation from mean vs. drive frequency (N={n_captured} sweeps)")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(OUTPUT_PNG, dpi=150)
     print(f"Saved plot to {OUTPUT_PNG}")
 
-    dip_idx = np.argmin(dev_v1)
-    dip_depth_pct = 100 * (mean_v1 - avg_v1[dip_idx]) / mean_v1 if mean_v1 else float("nan")
+    dip_idx = np.argmin(dev_pct_v1)
     print(
         f"\nMean detector level: {mean_v1:.5f} V\n"
-        f"Deepest dip: {dev_v1[dip_idx]:.5f} V below mean at {freq_ghz[dip_idx]:.4f} GHz "
-        f"({dip_depth_pct:.2f}% below mean)"
+        f"Deepest dip: {dev_pct_v1[dip_idx]:.2f}% below mean at {freq_ghz[dip_idx]:.4f} GHz"
     )
 
     plt.show()
