@@ -66,10 +66,16 @@ TIMEOUT_MS = 5000
 # odmr_averaged_sweep.py's CAPTURE_FRACTION_OF_PERIOD.
 CAPTURE_FRACTION_OF_PERIOD = 0.93
 
-# This 33220A's actual CH2 output (2.85 Vpp, 7.9 V average) doesn't track
-# the commanded --ampl-vpp/--offset-v 1:1, so the ramp's true minimum has
-# to be given directly rather than derived from those flags.
-REAL_CH2_VMIN = 7.9 - 2.85 / 2.0
+# This 33220A's actual CH2 output doesn't track the commanded
+# --ampl-vpp/--offset-v 1:1, so the ramp's true minimum has to be given
+# directly rather than derived from those flags. Values below are from a
+# live :MEASURE? query on the scope (VMIN=6.45 V, VMAX=9.34 V, VPP=2.89 V).
+# The default trigger level also needs real margin above VMIN, not just
+# "slightly above" - sitting only ~25 mV above the true minimum put it right
+# in the ramp reset's noisiest region.
+REAL_CH2_VMIN = 6.45
+REAL_CH2_VPP = 2.89
+TRIGGER_MARGIN_FRAC = 0.15  # fraction of Vpp above VMIN
 
 
 def parse_args():
@@ -116,6 +122,15 @@ def parse_args():
     sc.add_argument("--autoscale", action=argparse.BooleanOptionalAction, default=True,
                      help="Autoscale enabled channels' vertical range/offset instead of using "
                           "the --chN-range-v/--chN-offset-v values (default: on).")
+    sc.add_argument("--ch1-headroom", type=float, default=4.0,
+                     help="After autoscaling, multiply CH1's V/div by this factor (default: 4.0) so a "
+                           "rare large transient (e.g. electrical interference) is recorded at its true "
+                           "amplitude instead of clipping/railing at the autoscaled range's edge - "
+                           "autoscale only sizes to the signal it sees during its brief sampling window, "
+                           "not to rare outliers. 1.0 disables the extra margin.")
+    sc.add_argument("--ch2-headroom", type=float, default=1.0,
+                     help="Same as --ch1-headroom, for CH2 (default: 1.0, no extra margin - CH2 is a "
+                          "clean deterministic ramp and isn't prone to this).")
 
     acq = p.add_argument_group("Acquisition / trigger")
     acq.add_argument("--acquisition-type", choices=["sample", "average", "hresolution", "peak"], default="sample")
@@ -133,12 +148,14 @@ def parse_args():
                            "starts at the same phase of the ramp. Without this, captures start at an "
                            "essentially random ramp phase, which can put the flyback/reset itself inside "
                            "the capture window and corrupt the CH2-to-frequency conversion downstream.")
-    acq.add_argument("--trigger-level-v", type=float, default=REAL_CH2_VMIN,
-                      help="Default: the ramp's actual measured minimum voltage on this AWG "
-                           f"({REAL_CH2_VMIN} V) - NOT derived from --ampl-vpp/--offset-v, since this "
-                           "33220A's actual CH2 output (2.85 Vpp, 7.9 V average) doesn't track the "
-                           "commanded amplitude/offset 1:1. Override explicitly if you change the "
-                           "waveform range or measurement setup.")
+    acq.add_argument("--trigger-level-v", type=float,
+                      default=REAL_CH2_VMIN + TRIGGER_MARGIN_FRAC * REAL_CH2_VPP,
+                      help="Default: the ramp's actual measured minimum voltage on this AWG, plus a "
+                           f"{TRIGGER_MARGIN_FRAC:.0%} margin ({REAL_CH2_VMIN + TRIGGER_MARGIN_FRAC * REAL_CH2_VPP:.3f} V) "
+                           "- NOT derived from --ampl-vpp/--offset-v, since this 33220A's actual CH2 "
+                           "output doesn't track the commanded amplitude/offset 1:1, and not set right "
+                           "at the measured minimum, since that's the noisiest part of the ramp reset. "
+                           "Override explicitly if you change the waveform range or measurement setup.")
     acq.add_argument("--trigger-slope", choices=["positive", "negative"], default="positive")
     acq.add_argument("--trigger-holdoff-s", type=float, default=0.0)
     acq.add_argument("--runs", type=int, default=100, help="Number of single-shot acquisitions to average.")
@@ -190,28 +207,40 @@ def setup_awg(inst, args):
 
 def setup_scope(inst, args):
     channel_settings = (
-        (1, args.ch1_enabled, args.ch1_coupling, args.ch1_probe_atten, args.ch1_range_v, args.ch1_offset_v),
-        (2, args.ch2_enabled, args.ch2_coupling, args.ch2_probe_atten, args.ch2_range_v, args.ch2_offset_v),
+        (1, args.ch1_enabled, args.ch1_coupling, args.ch1_probe_atten, args.ch1_range_v, args.ch1_offset_v,
+         args.ch1_headroom),
+        (2, args.ch2_enabled, args.ch2_coupling, args.ch2_probe_atten, args.ch2_range_v, args.ch2_offset_v,
+         args.ch2_headroom),
     )
 
     # Coupling and probe attenuation affect what a correct autoscale looks
     # like, so set those before autoscaling rather than after.
-    for ch, enabled, coupling, atten, rng, offset in channel_settings:
+    for ch, enabled, coupling, atten, rng, offset, headroom in channel_settings:
         inst.write(f":CHAN{ch}:DISPLAY {'ON' if enabled else 'OFF'}")
         if not enabled:
             continue
         inst.write(f":CHAN{ch}:COUPLING {coupling}")
         inst.write(f":CHAN{ch}:PROBE {atten}")
         if not args.autoscale:
-            inst.write(f":CHAN{ch}:RANGE {rng}")
+            inst.write(f":CHAN{ch}:RANGE {rng * headroom}")
             inst.write(f":CHAN{ch}:OFFSET {offset}")
 
     enabled_channels = [ch for ch, enabled, *_ in channel_settings if enabled]
+    headroom_by_channel = {ch: headroom for ch, enabled, *_, headroom in channel_settings if enabled}
     if args.autoscale:
         inst.write(":AUTOSCALE " + ",".join(f"CHAN{ch}" for ch in enabled_channels))
         time.sleep(2)
         for ch in enabled_channels:
             scale = float(inst.query(f":CHAN{ch}:SCALE?").strip())
+            headroom = headroom_by_channel[ch]
+            if headroom != 1.0:
+                # :CHANx:SCALE is V/div (8 divisions full-scale on this
+                # model); widen it so a rare large transient records at its
+                # true amplitude instead of clipping at the autoscaled
+                # range's edge, which only fit the signal autoscale saw
+                # during its brief sampling window.
+                inst.write(f":CHAN{ch}:SCALE {scale * headroom}")
+                scale = float(inst.query(f":CHAN{ch}:SCALE?").strip())
             offset = float(inst.query(f":CHAN{ch}:OFFSET?").strip())
             print(f"[Scope] CHAN{ch} autoscaled to {scale * 1e3:.2f} mV/div, {offset * 1e3:.2f} mV offset.")
 
@@ -225,6 +254,13 @@ def setup_scope(inst, args):
     inst.write(f":TRIGGER:EDGE:SLOPE {'POSITIVE' if args.trigger_slope == 'positive' else 'NEGATIVE'}")
     if args.trigger_holdoff_s > 0:
         inst.write(f":TRIGGER:HOLDOFF {args.trigger_holdoff_s}")
+    # NORMAL (not the default AUTO): AUTO forces the display to keep
+    # refreshing with an unsynchronized free-run sweep whenever it doesn't
+    # see a valid trigger, which looks exactly like a drifting waveform even
+    # once the level/slope/source/coupling are all correct. NORMAL only
+    # updates on a genuine trigger, so a real problem shows up as a frozen
+    # display instead of a misleadingly "live-looking" wandering one.
+    inst.write(":TRIGGER:SWEEP NORMAL")
 
     inst.write(f":ACQUIRE:TYPE {ACQ_TYPE_SCPI[args.acquisition_type]}")
     inst.write(":WAV:FORMAT WORD")

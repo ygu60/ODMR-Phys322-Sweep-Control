@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 odmr_averaged_sweep.csv
 odmr_averaged_sweep.png
+
+# Raw per-sample trace CSVs from --save-traces routinely reach hundreds of
+# MB to multiple GB - well past GitHub's 100 MB per-file limit. Keep these
+# as local-only archives, not git-tracked.
+csv_output/*traces*.csv

@@ -39,12 +39,25 @@ AWG_ADDR = "GPIB0::5::INSTR"
 
 # --- Sawtooth drive on the 33220A (VCO tuning voltage sweep) ---
 FREQ_HZ = 100            # sawtooth sweep rate
-AMPL_VPP = 1.5           # 1.5 V peak-to-peak
-OFFSET_V = 4.0           # 4 V offset -> ramps 3.25 V to 4.75 V
+AMPL_VPP = 1.5           # commanded peak-to-peak (VOLT); NOT what actually comes out - see below
+OFFSET_V = 4.0           # commanded offset (VOLT:OFFS); NOT what actually comes out - see below
 RAMP_SYMMETRY_PCT = 100  # 100 = rising sawtooth
 RAMP_PERIOD_S = 1.0 / FREQ_HZ
-RAMP_VMIN = OFFSET_V - AMPL_VPP / 2.0
+RAMP_VMIN = OFFSET_V - AMPL_VPP / 2.0  # commanded range, for the console log only
 RAMP_VMAX = OFFSET_V + AMPL_VPP / 2.0
+
+# This 33220A's actual CH2 output doesn't track the commanded
+# AMPL_VPP/OFFSET_V 1:1, so the trigger level - which has to match the real
+# waveform to ever fire - is given directly instead of being derived from
+# RAMP_VMIN. Values below are from a live :MEASURE? query on the scope
+# (VMIN=6.45 V, VMAX=9.34 V, VPP=2.89 V). Using RAMP_VMIN (3.25 V) sits
+# entirely below this range, so EDGE trigger never finds a valid crossing
+# and the scope free-runs instead of locking phase. The level also needs
+# real margin above VMIN, not just "slightly above" - sitting only ~25 mV
+# above the true minimum put it right in the ramp reset's noisiest region.
+REAL_CH2_VMIN = 6.45
+REAL_CH2_VPP = 2.89
+TRIGGER_MARGIN_FRAC = 0.15  # fraction of Vpp above VMIN
 
 # --- Voltage -> RF frequency calibration (from band-edge measurements) ---
 V_TO_F_SLOPE_GHZ_PER_V = 0.1201024911
@@ -67,9 +80,10 @@ CH1_COUPLING = "DC"
 CAPTURE_FRACTION_OF_PERIOD = 0.93
 TIMEBASE_RANGE_S = RAMP_PERIOD_S * CAPTURE_FRACTION_OF_PERIOD
 
-# Trigger just after the ramp resets (slightly above the ramp's minimum) on a
-# rising edge of CHAN2, so every capture starts at the same phase of the sweep.
-TRIGGER_LEVEL_V = RAMP_VMIN
+# Trigger with real margin above the ramp's minimum (not right at it, where
+# reset noise lives) on a rising edge of CHAN2, so every capture starts at
+# the same phase of the sweep.
+TRIGGER_LEVEL_V = REAL_CH2_VMIN + TRIGGER_MARGIN_FRAC * REAL_CH2_VPP
 
 TIMEOUT_MS = 5000
 
@@ -97,10 +111,16 @@ def setup_scope(inst):
     inst.write(":CHAN1:DISPLAY ON")
     inst.write(":CHAN2:DISPLAY ON")
 
-    # Force DC coupling on CHAN1 before autoscaling, so autoscale sizes the
-    # vertical scale/offset for the actual DC-coupled detector signal rather
-    # than whatever coupling was left over from a previous run.
+    # Force DC coupling on both channels before autoscaling. CHAN1: so
+    # autoscale sizes the vertical scale/offset for the actual DC-coupled
+    # detector signal rather than whatever coupling was left over from a
+    # previous run. CHAN2: triggering by absolute voltage (TRIGGER_LEVEL_V)
+    # only makes sense DC-coupled - under AC coupling the DC offset is
+    # stripped and the ramp centers on 0V, so the trigger level would sit
+    # entirely outside the signal's range and never find a valid crossing
+    # (visible on the scope as trigger status stuck on "Auto").
     inst.write(f":CHAN1:COUPLING {CH1_COUPLING}")
+    inst.write(":CHAN2:COUPLING DC")
 
     # Autoscale both channels so CHAN1's V/div and offset are sized to
     # whatever the detector signal actually is, not a guessed fixed range.
@@ -121,6 +141,13 @@ def setup_scope(inst):
     inst.write(":TRIGGER:EDGE:SOURCE CHAN2")
     inst.write(f":TRIGGER:EDGE:LEVEL {TRIGGER_LEVEL_V}")
     inst.write(":TRIGGER:EDGE:SLOPE POSITIVE")
+    # NORMAL (not the default AUTO): AUTO forces the display to keep
+    # refreshing with an unsynchronized free-run sweep whenever it doesn't
+    # see a valid trigger, which looks exactly like a drifting waveform even
+    # once the level/slope/source/coupling are all correct. NORMAL only
+    # updates on a genuine trigger, so a real problem shows up as a frozen
+    # display instead of a misleadingly "live-looking" wandering one.
+    inst.write(":TRIGGER:SWEEP NORMAL")
 
     # Max vertical resolution per acquisition, modest record length so 300+
     # single-shot transfers over USB stay reasonably fast.
