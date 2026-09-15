@@ -40,7 +40,7 @@ All CSV output goes to csv_output/ (created automatically if missing).
 Requires: pip install pyvisa pyvisa-py numpy
 
 Usage:
-  python odmr_labview_replica.py --runs 100 --waveform ramp --freq-hz 100 --ampl-vpp 1.5 --offset-v 4.0 --ch2-enabled
+  python odmr_labview_replica.py --runs 100 --waveform ramp --ampl-vpp 1.5 --offset-v 4.0 --save-traces
 """
 
 import argparse
@@ -65,6 +65,11 @@ TIMEOUT_MS = 5000
 # Capture slightly less than one full ramp period - same rationale as
 # odmr_averaged_sweep.py's CAPTURE_FRACTION_OF_PERIOD.
 CAPTURE_FRACTION_OF_PERIOD = 0.93
+
+# This 33220A's actual CH2 output (2.85 Vpp, 7.9 V average) doesn't track
+# the commanded --ampl-vpp/--offset-v 1:1, so the ramp's true minimum has
+# to be given directly rather than derived from those flags.
+REAL_CH2_VMIN = 7.9 - 2.85 / 2.0
 
 
 def parse_args():
@@ -97,7 +102,9 @@ def parse_args():
 
     sc = p.add_argument_group("Oscilloscope channels (Fig. 9, remainder)")
     sc.add_argument("--ch1-enabled", action=argparse.BooleanOptionalAction, default=True)
-    sc.add_argument("--ch2-enabled", action=argparse.BooleanOptionalAction, default=False)
+    sc.add_argument("--ch2-enabled", action=argparse.BooleanOptionalAction, default=True,
+                     help="Default: on - CH2 is both the default trigger source (see "
+                          "--trigger-source) and required for the voltage-to-frequency pipeline.")
     sc.add_argument("--ch1-coupling", choices=["DC", "AC"], default="DC")
     sc.add_argument("--ch2-coupling", choices=["DC", "AC"], default="DC")
     sc.add_argument("--ch1-probe-atten", type=float, default=1.0)
@@ -120,9 +127,19 @@ def parse_args():
     acq.add_argument("--min-record-length", type=int, default=10000,
                       help="Points per acquisition (default: 10000, raised from an earlier 2000 default "
                            "for finer frequency resolution across the same swept span).")
-    acq.add_argument("--trigger-source", choices=["CHAN1", "CHAN2"], default="CHAN1")
-    acq.add_argument("--trigger-level-v", type=float, default=0.0)
-    acq.add_argument("--trigger-slope", choices=["positive", "negative"], default="negative")
+    acq.add_argument("--trigger-source", choices=["CHAN1", "CHAN2"], default="CHAN2",
+                      help="Default: CHAN2 (the sawtooth), triggering on its rising edge at the ramp's "
+                           "minimum - the same approach odmr_averaged_sweep.py uses - so every capture "
+                           "starts at the same phase of the ramp. Without this, captures start at an "
+                           "essentially random ramp phase, which can put the flyback/reset itself inside "
+                           "the capture window and corrupt the CH2-to-frequency conversion downstream.")
+    acq.add_argument("--trigger-level-v", type=float, default=REAL_CH2_VMIN,
+                      help="Default: the ramp's actual measured minimum voltage on this AWG "
+                           f"({REAL_CH2_VMIN} V) - NOT derived from --ampl-vpp/--offset-v, since this "
+                           "33220A's actual CH2 output (2.85 Vpp, 7.9 V average) doesn't track the "
+                           "commanded amplitude/offset 1:1. Override explicitly if you change the "
+                           "waveform range or measurement setup.")
+    acq.add_argument("--trigger-slope", choices=["positive", "negative"], default="positive")
     acq.add_argument("--trigger-holdoff-s", type=float, default=0.0)
     acq.add_argument("--runs", type=int, default=100, help="Number of single-shot acquisitions to average.")
     acq.add_argument("--save-traces", action="store_true", default=False,

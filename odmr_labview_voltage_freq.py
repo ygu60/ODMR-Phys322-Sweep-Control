@@ -11,15 +11,20 @@ sweeps with an irregular single-sample spike/glitch (a jump between
 adjacent samples larger than the threshold, as distinct from a broad
 max-min range). For each remaining sweep:
 
-  1. Convert CH2 (VCO tuning voltage) to frequency directly - voltage, not
-     time, is the independent variable here, since CH2 is the actual
-     per-sample tuning voltage rather than an assumed-linear time ramp:
+  1. Fit CH2 (VCO tuning voltage) to a straight line vs. sample index, then
+     convert that fit - not the raw per-sample CH2 value - to frequency:
 
-         freq_GHz = V_TO_F_SLOPE_GHZ_PER_V * V_ch2 + V_TO_F_INTERCEPT_GHZ
+         freq_GHz = V_TO_F_SLOPE_GHZ_PER_V * V_ch2_fit + V_TO_F_INTERCEPT_GHZ
 
-     (same calibration as odmr_averaged_sweep.py). Samples are sorted by
-     frequency first, since per-sample scope noise on CH2 can make the raw
-     voltage-to-frequency mapping non-monotonic within a sweep.
+     (same calibration as odmr_averaged_sweep.py). The ramp is linear by
+     design, so this recovers a smooth, strictly monotonic frequency axis.
+     Using each raw (noisy) CH2 sample directly doesn't: at high
+     --min-record-length the true per-sample voltage step becomes smaller
+     than CH2's own measurement noise, so sorting samples by their raw
+     computed frequency scrambles time-adjacency - points that end up next
+     to each other after sorting can come from far-apart, uncorrelated
+     times, producing a jagged reconstruction even when the real (time
+     domain) signal is smooth on the scope.
   2. Interpolate that sweep's CH1 (detector) signal onto a common frequency
      grid.
   3. Normalize per-run (--normalize-per-run, on by default): rescale the
@@ -67,12 +72,13 @@ PNG_DIR = "png_output"
 DEFAULT_INPUT_CSV = os.path.join(CSV_DIR, "odmr_labview_replica_traces.csv")
 OUTPUT_CSV = os.path.join(CSV_DIR, "odmr_labview_voltage_freq.csv")
 OUTPUT_PNG = os.path.join(PNG_DIR, "odmr_labview_voltage_freq.png")
+OUTPUT_KEPT_VS_DISCARDED_PNG = os.path.join(PNG_DIR, "odmr_labview_voltage_freq_kept_vs_discarded.png")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", default=DEFAULT_INPUT_CSV, help="Raw traces CSV from odmr_labview_replica.py --save-traces.")
-    p.add_argument("--grid-points", type=int, default=1953, help="Number of points in the common frequency grid.")
+    p.add_argument("--grid-points", type=int, default=1000, help="Number of points in the common frequency grid.")
     p.add_argument("--min-diff-mv", type=float, default=None,
                    help="Only include sweeps whose CH1 max-min difference exceeds this threshold (mV) - "
                         "same quality filter as odmr_labview_replica.py's --min-diff-mv. Unset: use all sweeps.")
@@ -83,6 +89,17 @@ def parse_args():
     p.add_argument("--normalize-per-run", action=argparse.BooleanOptionalAction, default=False,
                    help="Rescale each sweep to its own mean before averaging, so sweep-to-sweep "
                         "gain/offset drift (e.g. laser RIN) doesn't bias the average (default: on).")
+    p.add_argument("--despike-window", type=int, default=5,
+                   help="Rolling-median window (samples, odd) used to detect per-sample spikes within "
+                        "each kept sweep - distinct from --max-jump-mv, which rejects a whole sweep. "
+                        "0 disables despiking (default: 5).")
+    p.add_argument("--despike-threshold-mv", type=float, default=15.0,
+                   help="A sample is replaced by its local rolling-median value if it deviates from that "
+                        "median by more than this (mV) (default: 15).")
+    p.add_argument("--diagnostic-traces", type=int, default=10,
+                   help="When --min-diff-mv/--max-jump-mv filter out sweeps, plot this many kept and "
+                        "this many discarded raw CH1-vs-frequency traces side by side for inspection "
+                        "(0 disables this diagnostic plot).")
     return p.parse_args()
 
 
@@ -110,6 +127,64 @@ def load_sweeps(path):
     return {run_idx: (np.array(ch1), np.array(ch2)) for run_idx, (ch1, ch2) in sweeps.items()}
 
 
+def despike(v, window, threshold_mv):
+    """Replace samples that deviate from their local rolling median by more
+    than threshold_mv with that median - cleans up isolated per-sample
+    glitches within an otherwise-good sweep, in original (time) sample
+    order, before frequency sorting/interpolation. Returns (cleaned, n_replaced)."""
+    if window <= 1 or len(v) < window:
+        return v, 0
+
+    pad = window // 2
+    padded = np.pad(v, pad, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, window)
+    local_median = np.median(windows, axis=1)
+
+    outliers = np.abs(v - local_median) * 1e3 > threshold_mv
+    cleaned = v.copy()
+    cleaned[outliers] = local_median[outliers]
+    return cleaned, int(np.sum(outliers))
+
+
+def smooth_freq_axis(ch2_v):
+    """Fit CH2 to a straight line vs. sample index and convert that fit -
+    not the raw per-sample value - to frequency. The ramp is linear by
+    design, so this recovers a smooth, strictly monotonic frequency axis;
+    using each raw (noisy) CH2 sample directly lets scope measurement noise
+    dominate the sort order once the true per-sample voltage step is small
+    (i.e. at high --min-record-length), scrambling time-adjacency and
+    producing a jagged reconstruction of an otherwise-smooth signal."""
+    idx = np.arange(len(ch2_v))
+    slope, intercept = np.polyfit(idx, ch2_v, 1)
+    ch2_fit = slope * idx + intercept
+    return V_TO_F_SLOPE_GHZ_PER_V * ch2_fit + V_TO_F_INTERCEPT_GHZ
+
+
+def plot_kept_vs_discarded(kept, discarded, n):
+    """Plot up to n raw CH1-vs-frequency traces each from kept and
+    discarded sweeps, side by side, so a filter's effect can be inspected."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), sharex=True, sharey=True)
+
+    for ax, group, title, color in (
+        (ax1, kept, "Kept", "tab:blue"),
+        (ax2, discarded, "Discarded", "tab:red"),
+    ):
+        run_ids = list(group)[:n]
+        for run_idx in run_ids:
+            ch1_v, ch2_v = group[run_idx]
+            freq_ghz = smooth_freq_axis(ch2_v)
+            order = np.argsort(freq_ghz)
+            ax.plot(freq_ghz[order], ch1_v[order], color=color, alpha=0.6, linewidth=0.8)
+        ax.set_xlabel("Microwave drive frequency (GHz)")
+        ax.set_title(f"{title} ({len(run_ids)}/{len(group)} shown)")
+        ax.grid(True, alpha=0.3)
+
+    ax1.set_ylabel("CH1 detector output (V)")
+    fig.tight_layout()
+    fig.savefig(OUTPUT_KEPT_VS_DISCARDED_PNG, dpi=150)
+    print(f"Saved kept-vs-discarded diagnostic plot to {OUTPUT_KEPT_VS_DISCARDED_PNG}")
+
+
 def main():
     args = parse_args()
     os.makedirs(CSV_DIR, exist_ok=True)
@@ -119,12 +194,15 @@ def main():
     print(f"Loaded {n_loaded} sweeps from {args.input}")
 
     output_csv, output_png = OUTPUT_CSV, OUTPUT_PNG
+    discarded = {}
     if args.min_diff_mv is not None or args.max_jump_mv is not None:
         kept = {}
         for run_idx, (ch1_v, ch2_v) in sweeps.items():
             if args.min_diff_mv is not None and (np.max(ch1_v) - np.min(ch1_v)) * 1e3 <= args.min_diff_mv:
+                discarded[run_idx] = (ch1_v, ch2_v)
                 continue
             if args.max_jump_mv is not None and np.max(np.abs(np.diff(ch1_v))) * 1e3 > args.max_jump_mv:
+                discarded[run_idx] = (ch1_v, ch2_v)
                 continue
             kept[run_idx] = (ch1_v, ch2_v)
         sweeps = kept
@@ -139,12 +217,24 @@ def main():
         root, ext = os.path.splitext(OUTPUT_PNG)
         output_png = f"{root}_filtered{ext}"
 
-    # Convert each sweep's tuning voltage to frequency, sorted ascending so
-    # interpolation is well-defined despite per-sample noise on CH2.
+    if args.diagnostic_traces > 0 and discarded:
+        plot_kept_vs_discarded(sweeps, discarded, args.diagnostic_traces)
+
+    # Convert each sweep's tuning voltage to frequency via a linear fit
+    # (see smooth_freq_axis), sorted ascending so interpolation is
+    # well-defined.
     sweep_freqs = []
     sweep_intensities = []
+    n_despiked = 0
     for ch1_v, ch2_v in sweeps.values():
-        freq_ghz = V_TO_F_SLOPE_GHZ_PER_V * ch2_v + V_TO_F_INTERCEPT_GHZ
+        if args.despike_window > 0:
+            # Despike in original (time) sample order, before frequency
+            # sorting - an isolated glitch is a neighbor in time, not
+            # necessarily in the (noisy) frequency ordering.
+            ch1_v, n = despike(ch1_v, args.despike_window, args.despike_threshold_mv)
+            n_despiked += n
+
+        freq_ghz = smooth_freq_axis(ch2_v)
         order = np.argsort(freq_ghz)
         intensity = ch1_v[order]
 
@@ -162,6 +252,12 @@ def main():
 
         sweep_freqs.append(freq_ghz[order])
         sweep_intensities.append(intensity)
+
+    if args.despike_window > 0:
+        print(
+            f"Despiked {n_despiked} samples across {len(sweeps)} sweeps "
+            f"(window={args.despike_window}, threshold={args.despike_threshold_mv:.0f} mV)"
+        )
 
     # Common frequency grid: the intersection of all sweeps' frequency
     # ranges, so every grid point can be interpolated without extrapolating.
@@ -201,24 +297,15 @@ def main():
             writer.writerow([fq, avg, sd, c, rn])
     print(f"Saved averaged, voltage-derived spectrum to {output_csv}")
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 11), sharex=True)
+    fig, ax1 = plt.subplots(figsize=(9, 5))
 
     ax1.plot(freq_grid, i_avg, linewidth=1)
     ax1.fill_between(freq_grid, i_avg - i_sd, i_avg + i_sd, alpha=0.25)
+    ax1.set_xlabel("Microwave drive frequency (GHz)")
     ax1.set_ylabel(f"Detector output ({avg_unit})")
     title_suffix = ", per-run normalized" if args.normalize_per_run else ""
     ax1.set_title(f"Averaged detector response vs. drive frequency (N={len(sweeps)} sweeps{title_suffix})")
     ax1.grid(True, alpha=0.3)
-
-    ax2.plot(freq_grid, contrast_pct, linewidth=1)
-    ax2.axhline(0, color="black", linewidth=0.5, alpha=0.5)
-    ax2.set_ylabel("Contrast vs. baseline max (%)")
-    ax2.grid(True, alpha=0.3)
-
-    ax3.plot(freq_grid, relative_noise_pct, linewidth=1)
-    ax3.set_xlabel("Microwave drive frequency (GHz)")
-    ax3.set_ylabel("Relative noise, SD/|mean| (%)")
-    ax3.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(output_png, dpi=150)
