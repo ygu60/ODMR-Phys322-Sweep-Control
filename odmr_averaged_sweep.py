@@ -1,146 +1,272 @@
 """
-ODMR averaged-sweep capture.
+General-purpose max/min contrast acquisition, replicating the LabVIEW VI
+architecture described in the lab's IO Architecture instructions (Figures 9
+and 10):
 
-Collects several hundred single-shot sweeps of:
-  CHAN1 - PDA36A2 amplifier/detector output (the fluorescence-proportional signal)
-  CHAN2 - the 33220A sawtooth drive (V_tune to the VCO)
-triggered so every sweep starts at the same point in the ramp, averages them
-point-by-point to beat down noise, converts the averaged sawtooth voltage into
-microwave drive frequency, and plots detector output vs. frequency looking for
-a resonance dip (analogous to the ODMR literature - e.g. Zhang et al., Am. J.
-Phys. 86, 225 (2018), which reports an ~8% fluorescence dip on resonance).
+  - Function generator block (Fig. 9, top left): configures the AWG's
+    waveform, frequency, amplitude, offset, ramp symmetry, and burst mode.
+    Runs once at the start of the program. If --no-change-pulse is passed
+    (the VI's "change pulse" button off), this block is skipped entirely and
+    whatever the AWG is already outputting is left alone.
 
-This is a dedicated DATA-COLLECTION script, distinct from the live console
-monitor - because averaging requires hundreds of individually-triggered
-:DIGITIZE acquisitions, the scope will be taken out of continuous run for the
-duration of the capture (each :DIGITIZE arms, waits for the sawtooth trigger,
-and grabs one sweep). Normal continuous display is restored at the end.
+  - Oscilloscope control block (Fig. 9, remainder): configures CHAN1/CHAN2
+    coupling, probe attenuation, on/off, vertical range/offset, acquisition
+    type, and the trigger (source, level, slope, holdoff), then digitizes
+    --runs single-shot acquisitions ("Runs" / "Current #").
 
-Requires: pip install pyvisa pyvisa-py numpy matplotlib
+  - Data-processing block (Fig. 10): for each run, records that waveform's
+    max and min ("Average Max" / "Average Minimum" boxes acting on the
+    current run), then across all runs computes the overall Average Max 2 /
+    Average Minimum 2 / Difference (mV) / Percent Diff.
+
+This script is a generic single-channel-of-interest contrast measurement:
+point it at CHAN1 for any max/min-style measurement and it captures/reports
+the same statistics as the VI.
+
+Not replicated: the VI's live front-panel graphs update after every run, and
+the "All runs + Average and SD curves" / "Create Histogram" plots - this
+script is CSV-output only and prints per-run progress to the console.
+"Serial Configuration" (VISA resource setup) is handled transparently by
+pyvisa and has no separate control here.
+
+Pass --save-traces to additionally dump every run's raw per-sample CH1/CH2
+voltages to csv_output/ODMR_Trace_<field>_N<runs>_<timestamp>.csv -
+odmr_voltage_freq_analysis.py consumes that file (via --input) to convert
+each sweep's CH2 tuning voltage to frequency and average the sweeps on a
+common frequency grid.
+
+All CSV output goes to csv_output/ (created automatically if missing).
+
+Requires: pip install pyvisa pyvisa-py numpy
 
 Usage:
-  python odmr_averaged_sweep.py
+  python odmr_averaged_sweep.py --runs 100 --waveform ramp --ampl-vpp 1.5 --offset-v 4.0 --save-traces
 """
 
+import argparse
 import csv
+import datetime
 import os
 import time
+
 import numpy as np
 import pyvisa
-import matplotlib.pyplot as plt
 
-# --- Output folders ---
+DEFAULT_SCOPE_ADDR = "USB0::0x2A8D::0x0396::CN63257664::0::INSTR"
+DEFAULT_AWG_ADDR = "GPIB0::5::INSTR"
+
+# --- Output folder ---
 CSV_DIR = "csv_output"
-PNG_DIR = "png_output"
 
-# --- Instrument addresses ---
-SCOPE_ADDR = "USB0::0x2A8D::0x0396::CN63257664::0::INSTR"
-AWG_ADDR = "GPIB0::5::INSTR"
+# Experiment condition label for output filenames - fixed for now (not yet a
+# CLI flag); update this if you run at a different field.
+FIELD_LABEL = "0Field"
 
-# --- Sawtooth drive on the 33220A (VCO tuning voltage sweep) ---
-FREQ_HZ = 100            # sawtooth sweep rate
-AMPL_VPP = 1.5           # commanded peak-to-peak (VOLT); NOT what actually comes out - see below
-OFFSET_V = 4.0           # commanded offset (VOLT:OFFS); NOT what actually comes out - see below
-RAMP_SYMMETRY_PCT = 100  # 100 = rising sawtooth
-RAMP_PERIOD_S = 1.0 / FREQ_HZ
-RAMP_VMIN = OFFSET_V - AMPL_VPP / 2.0  # commanded range, for the console log only
-RAMP_VMAX = OFFSET_V + AMPL_VPP / 2.0
+
+def output_base_name(n_runs):
+    """ODMR_Trace_<field>_N<runs>_<MMDDYY>_<HHMM>, e.g.
+    ODMR_Trace_0Field_N1000_091526_1627 - matches
+    odmr_voltage_freq_analysis.py's naming convention."""
+    timestamp = datetime.datetime.now().strftime("%m%d%y_%H%M")
+    return f"ODMR_Trace_{FIELD_LABEL}_N{n_runs}_{timestamp}"
+
+TIMEOUT_MS = 5000
+
+# Capture slightly less than one full ramp period - same rationale as
+# odmr_averaged_sweep.py's CAPTURE_FRACTION_OF_PERIOD.
+CAPTURE_FRACTION_OF_PERIOD = 0.93
 
 # This 33220A's actual CH2 output doesn't track the commanded
-# AMPL_VPP/OFFSET_V 1:1, so the trigger level - which has to match the real
-# waveform to ever fire - is given directly instead of being derived from
-# RAMP_VMIN. Values below are from a live :MEASURE? query on the scope
-# (VMIN=6.45 V, VMAX=9.34 V, VPP=2.89 V). Using RAMP_VMIN (3.25 V) sits
-# entirely below this range, so EDGE trigger never finds a valid crossing
-# and the scope free-runs instead of locking phase. The level also needs
-# real margin above VMIN, not just "slightly above" - sitting only ~25 mV
-# above the true minimum put it right in the ramp reset's noisiest region.
+# --ampl-vpp/--offset-v 1:1, so the ramp's true minimum has to be given
+# directly rather than derived from those flags. Values below are from a
+# live :MEASURE? query on the scope (VMIN=6.45 V, VMAX=9.34 V, VPP=2.89 V).
+# The default trigger level also needs real margin above VMIN, not just
+# "slightly above" - sitting only ~25 mV above the true minimum put it right
+# in the ramp reset's noisiest region.
 REAL_CH2_VMIN = 6.45
 REAL_CH2_VPP = 2.89
 TRIGGER_MARGIN_FRAC = 0.15  # fraction of Vpp above VMIN
 
-# --- Voltage -> RF frequency calibration (from band-edge measurements) ---
-V_TO_F_SLOPE_GHZ_PER_V = 0.1201024911
-V_TO_F_INTERCEPT_GHZ = 1.933
 
-# --- Averaging ---
-NUM_AVERAGES = 100      # "several hundred" sweeps
-POINTS_PER_SWEEP = 2000  # per-acquisition record length (kept modest so 300+
-                         # USB transfers don't take forever)
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
-# --- Scope channel settings ---
-CH1_COUPLING = "DC"
+    addr = p.add_argument_group("Instrument addresses")
+    addr.add_argument("--scope-addr", default=DEFAULT_SCOPE_ADDR)
+    addr.add_argument("--awg-addr", default=DEFAULT_AWG_ADDR)
 
-# Capture slightly less than one full period. The flyback isn't perfectly
-# instantaneous (finite AWG reset time, plus small period mismatch between the
-# AWG's actual output and the host-computed RAMP_PERIOD_S), so a window sized
-# to exactly one period ends up running past the reset and picking up the
-# leading rise of the next cycle. Trimming the window leaves margin so it
-# always ends before that happens, at the cost of a bit of the ramp's tail.
-CAPTURE_FRACTION_OF_PERIOD = 0.93
-TIMEBASE_RANGE_S = RAMP_PERIOD_S * CAPTURE_FRACTION_OF_PERIOD
+    fg = p.add_argument_group("Function generator (Fig. 9, top left)")
+    fg.add_argument("--change-pulse", dest="change_pulse", action="store_true", default=True,
+                     help="Reconfigure the AWG at startup (default: on).")
+    fg.add_argument("--no-change-pulse", dest="change_pulse", action="store_false",
+                     help="Leave the AWG's current output untouched (VI's 'change pulse' button off).")
+    fg.add_argument("--reset", dest="reset_awg", action="store_true", default=True,
+                     help="Send *RST to the AWG before configuring it (default: on).")
+    fg.add_argument("--no-reset", dest="reset_awg", action="store_false")
+    fg.add_argument("--waveform", choices=["sine", "ramp"], default="ramp",
+                     help="1=Sine, 4=Ramp in the VI's waveform selector.")
+    fg.add_argument("--freq-hz", type=float, default=20.0,
+                     help="Sawtooth sweep rate (default: 20 Hz, slowed from an earlier 100 Hz default "
+                          "to give the VCO/detector more time per frequency step to settle, reducing "
+                          "dynamic distortion of the resonance dip).")
+    fg.add_argument("--ampl-vpp", type=float, default=1.5)
+    fg.add_argument("--offset-v", type=float, default=4.0, help="DC offset, at center.")
+    fg.add_argument("--ramp-symmetry-pct", type=float, default=100.0,
+                     help="Only used when --waveform ramp; 100 = rising sawtooth.")
+    fg.add_argument("--burst", action="store_true", default=False)
+    fg.add_argument("--burst-phase-deg", type=float, default=0.0)
 
-# Trigger with real margin above the ramp's minimum (not right at it, where
-# reset noise lives) on a rising edge of CHAN2, so every capture starts at
-# the same phase of the sweep.
-TRIGGER_LEVEL_V = REAL_CH2_VMIN + TRIGGER_MARGIN_FRAC * REAL_CH2_VPP
+    sc = p.add_argument_group("Oscilloscope channels (Fig. 9, remainder)")
+    sc.add_argument("--ch1-enabled", action=argparse.BooleanOptionalAction, default=True)
+    sc.add_argument("--ch2-enabled", action=argparse.BooleanOptionalAction, default=True,
+                     help="Default: on - CH2 is both the default trigger source (see "
+                          "--trigger-source) and required for the voltage-to-frequency pipeline.")
+    sc.add_argument("--ch1-coupling", choices=["DC", "AC"], default="DC")
+    sc.add_argument("--ch2-coupling", choices=["DC", "AC"], default="DC")
+    sc.add_argument("--ch1-probe-atten", type=float, default=1.0)
+    sc.add_argument("--ch2-probe-atten", type=float, default=1.0)
+    sc.add_argument("--ch1-range-v", type=float, default=2.0, help="Full-scale vertical range.")
+    sc.add_argument("--ch2-range-v", type=float, default=2.0)
+    sc.add_argument("--ch1-offset-v", type=float, default=0.0)
+    sc.add_argument("--ch2-offset-v", type=float, default=0.0)
+    sc.add_argument("--autoscale", action=argparse.BooleanOptionalAction, default=True,
+                     help="Autoscale enabled channels' vertical range/offset instead of using "
+                          "the --chN-range-v/--chN-offset-v values (default: on).")
+    sc.add_argument("--ch1-headroom", type=float, default=4.0,
+                     help="After autoscaling, multiply CH1's V/div by this factor (default: 4.0) so a "
+                           "rare large transient (e.g. electrical interference) is recorded at its true "
+                           "amplitude instead of clipping/railing at the autoscaled range's edge - "
+                           "autoscale only sizes to the signal it sees during its brief sampling window, "
+                           "not to rare outliers. 1.0 disables the extra margin.")
+    sc.add_argument("--ch2-headroom", type=float, default=1.0,
+                     help="Same as --ch1-headroom, for CH2 (default: 1.0, no extra margin - CH2 is a "
+                          "clean deterministic ramp and isn't prone to this).")
 
-TIMEOUT_MS = 5000
+    acq = p.add_argument_group("Acquisition / trigger")
+    acq.add_argument("--acquisition-type", choices=["sample", "average", "hresolution", "peak"], default="sample")
+    acq.add_argument("--time-per-record-s", type=float, default=None,
+                      help="Timebase full-record span, seconds. Unset: derived from --freq-hz as "
+                           f"{CAPTURE_FRACTION_OF_PERIOD}/freq_hz, i.e. slightly less than one full "
+                           "ramp period (capturing exactly one period risks running past the ramp's "
+                           "reset into the next cycle's leading edge).")
+    acq.add_argument("--min-record-length", type=int, default=10000,
+                      help="Points per acquisition (default: 10000, raised from an earlier 2000 default "
+                           "for finer frequency resolution across the same swept span).")
+    acq.add_argument("--trigger-source", choices=["CHAN1", "CHAN2"], default="CHAN2",
+                      help="Default: CHAN2 (the sawtooth), triggering on its rising edge at the ramp's "
+                           "minimum - the same approach odmr_averaged_sweep.py uses - so every capture "
+                           "starts at the same phase of the ramp. Without this, captures start at an "
+                           "essentially random ramp phase, which can put the flyback/reset itself inside "
+                           "the capture window and corrupt the CH2-to-frequency conversion downstream.")
+    acq.add_argument("--trigger-level-v", type=float,
+                      default=REAL_CH2_VMIN + TRIGGER_MARGIN_FRAC * REAL_CH2_VPP,
+                      help="Default: the ramp's actual measured minimum voltage on this AWG, plus a "
+                           # %% (not %), since argparse does its own %-substitution on help strings
+                           f"{TRIGGER_MARGIN_FRAC * 100:.0f}%% margin "
+                           f"({REAL_CH2_VMIN + TRIGGER_MARGIN_FRAC * REAL_CH2_VPP:.3f} V) "
+                           "- NOT derived from --ampl-vpp/--offset-v, since this 33220A's actual CH2 "
+                           "output doesn't track the commanded amplitude/offset 1:1, and not set right "
+                           "at the measured minimum, since that's the noisiest part of the ramp reset. "
+                           "Override explicitly if you change the waveform range or measurement setup.")
+    acq.add_argument("--trigger-slope", choices=["positive", "negative"], default="positive")
+    acq.add_argument("--trigger-holdoff-s", type=float, default=0.0)
+    acq.add_argument("--runs", type=int, default=100, help="Number of single-shot acquisitions to average.")
+    acq.add_argument("--save-traces", action="store_true", default=False,
+                      help="Also save raw per-sample traces (time_s, chN_V per run) to "
+                           "csv_output/ODMR_Trace_<field>_N<runs>_<timestamp>.csv, e.g. for "
+                           "voltage-to-frequency sweep averaging downstream.")
 
-OUTPUT_CSV = os.path.join(CSV_DIR, "odmr_averaged_sweep.csv")
-OUTPUT_PNG = os.path.join(PNG_DIR, "odmr_averaged_sweep.png")
+    args = p.parse_args()
+    if args.time_per_record_s is None:
+        args.time_per_record_s = CAPTURE_FRACTION_OF_PERIOD / args.freq_hz
+    return args
 
 
-def setup_awg(inst):
-    inst.write("*RST")
-    time.sleep(0.5)
-    inst.write("FUNC RAMP")
-    inst.write(f"FUNC:RAMP:SYMMETRY {RAMP_SYMMETRY_PCT}")
-    inst.write(f"FREQ {FREQ_HZ}")
-    inst.write(f"VOLT {AMPL_VPP}")
-    inst.write(f"VOLT:OFFS {OFFSET_V}")
+ACQ_TYPE_SCPI = {
+    "sample": "NORMAL",
+    "average": "AVERAGE",
+    "hresolution": "HRESOLUTION",
+    "peak": "PEAK",
+}
+
+
+def setup_awg(inst, args):
+    if not args.change_pulse:
+        print("[AWG] --no-change-pulse: leaving current AWG output untouched.")
+        return
+
+    if args.reset_awg:
+        inst.write("*RST")
+        time.sleep(0.5)
+
+    inst.write("FUNC SIN" if args.waveform == "sine" else "FUNC RAMP")
+    if args.waveform == "ramp":
+        inst.write(f"FUNC:RAMP:SYMMETRY {args.ramp_symmetry_pct}")
+    inst.write(f"FREQ {args.freq_hz}")
+    inst.write(f"VOLT {args.ampl_vpp}")
+    inst.write(f"VOLT:OFFS {args.offset_v}")
+
+    inst.write(f"BURST:STATE {'ON' if args.burst else 'OFF'}")
+    if args.burst:
+        inst.write(f"BURST:PHASE {args.burst_phase_deg}")
+
     inst.write("OUTP ON")
     err = inst.query("SYST:ERR?").strip()
     print(
-        f"[33220A] Rising sawtooth {FREQ_HZ} Hz, {AMPL_VPP} Vpp, {OFFSET_V} V offset "
-        f"({RAMP_VMIN:.3f}-{RAMP_VMAX:.3f} V). SYST:ERR? -> {err}"
+        f"[AWG] {args.waveform} {args.freq_hz} Hz, {args.ampl_vpp} Vpp, "
+        f"{args.offset_v} V offset, burst={'ON' if args.burst else 'OFF'}. SYST:ERR? -> {err}"
     )
 
 
-def setup_scope(inst):
-    inst.write(":CHAN1:DISPLAY ON")
-    inst.write(":CHAN2:DISPLAY ON")
+def setup_scope(inst, args):
+    channel_settings = (
+        (1, args.ch1_enabled, args.ch1_coupling, args.ch1_probe_atten, args.ch1_range_v, args.ch1_offset_v,
+         args.ch1_headroom),
+        (2, args.ch2_enabled, args.ch2_coupling, args.ch2_probe_atten, args.ch2_range_v, args.ch2_offset_v,
+         args.ch2_headroom),
+    )
 
-    # Force DC coupling on both channels before autoscaling. CHAN1: so
-    # autoscale sizes the vertical scale/offset for the actual DC-coupled
-    # detector signal rather than whatever coupling was left over from a
-    # previous run. CHAN2: triggering by absolute voltage (TRIGGER_LEVEL_V)
-    # only makes sense DC-coupled - under AC coupling the DC offset is
-    # stripped and the ramp centers on 0V, so the trigger level would sit
-    # entirely outside the signal's range and never find a valid crossing
-    # (visible on the scope as trigger status stuck on "Auto").
-    inst.write(f":CHAN1:COUPLING {CH1_COUPLING}")
-    inst.write(":CHAN2:COUPLING DC")
+    # Coupling and probe attenuation affect what a correct autoscale looks
+    # like, so set those before autoscaling rather than after.
+    for ch, enabled, coupling, atten, rng, offset, headroom in channel_settings:
+        inst.write(f":CHAN{ch}:DISPLAY {'ON' if enabled else 'OFF'}")
+        if not enabled:
+            continue
+        inst.write(f":CHAN{ch}:COUPLING {coupling}")
+        inst.write(f":CHAN{ch}:PROBE {atten}")
+        if not args.autoscale:
+            inst.write(f":CHAN{ch}:RANGE {rng * headroom}")
+            inst.write(f":CHAN{ch}:OFFSET {offset}")
 
-    # Autoscale both channels so CHAN1's V/div and offset are sized to
-    # whatever the detector signal actually is, not a guessed fixed range.
-    inst.write(":AUTOSCALE CHAN1,CHAN2")
-    time.sleep(2)
+    enabled_channels = [ch for ch, enabled, *_ in channel_settings if enabled]
+    headroom_by_channel = {ch: headroom for ch, enabled, *_, headroom in channel_settings if enabled}
+    if args.autoscale:
+        inst.write(":AUTOSCALE " + ",".join(f"CHAN{ch}" for ch in enabled_channels))
+        time.sleep(2)
+        for ch in enabled_channels:
+            scale = float(inst.query(f":CHAN{ch}:SCALE?").strip())
+            headroom = headroom_by_channel[ch]
+            if headroom != 1.0:
+                # :CHANx:SCALE is V/div (8 divisions full-scale on this
+                # model); widen it so a rare large transient records at its
+                # true amplitude instead of clipping at the autoscaled
+                # range's edge, which only fit the signal autoscale saw
+                # during its brief sampling window.
+                inst.write(f":CHAN{ch}:SCALE {scale * headroom}")
+                scale = float(inst.query(f":CHAN{ch}:SCALE?").strip())
+            offset = float(inst.query(f":CHAN{ch}:OFFSET?").strip())
+            print(f"[Scope] CHAN{ch} autoscaled to {scale * 1e3:.2f} mV/div, {offset * 1e3:.2f} mV offset.")
 
-    ch1_scale = float(inst.query(":CHAN1:SCALE?").strip())
-    ch1_offset = float(inst.query(":CHAN1:OFFSET?").strip())
-
-    # Deterministic timebase: one clean rising ramp per trigger, starting
-    # right at the trigger point (reference at the left edge of the record).
-    inst.write(f":TIMEBASE:RANGE {TIMEBASE_RANGE_S}")
+    inst.write(f":TIMEBASE:RANGE {args.time_per_record_s}")
     inst.write(":TIMEBASE:REFERENCE LEFT")
     inst.write(":TIMEBASE:POSITION 0")
 
-    # Trigger on CHAN2 rising through the start of the ramp.
     inst.write(":TRIGGER:MODE EDGE")
-    inst.write(":TRIGGER:EDGE:SOURCE CHAN2")
-    inst.write(f":TRIGGER:EDGE:LEVEL {TRIGGER_LEVEL_V}")
-    inst.write(":TRIGGER:EDGE:SLOPE POSITIVE")
+    inst.write(f":TRIGGER:EDGE:SOURCE {args.trigger_source}")
+    inst.write(f":TRIGGER:EDGE:LEVEL {args.trigger_level_v}")
+    inst.write(f":TRIGGER:EDGE:SLOPE {'POSITIVE' if args.trigger_slope == 'positive' else 'NEGATIVE'}")
+    if args.trigger_holdoff_s > 0:
+        inst.write(f":TRIGGER:HOLDOFF {args.trigger_holdoff_s}")
     # NORMAL (not the default AUTO): AUTO forces the display to keep
     # refreshing with an unsynchronized free-run sweep whenever it doesn't
     # see a valid trigger, which looks exactly like a drifting waveform even
@@ -149,30 +275,28 @@ def setup_scope(inst):
     # display instead of a misleadingly "live-looking" wandering one.
     inst.write(":TRIGGER:SWEEP NORMAL")
 
-    # Max vertical resolution per acquisition, modest record length so 300+
-    # single-shot transfers over USB stay reasonably fast.
-    inst.write(":ACQUIRE:TYPE HRESOLUTION")
+    inst.write(f":ACQUIRE:TYPE {ACQ_TYPE_SCPI[args.acquisition_type]}")
     inst.write(":WAV:FORMAT WORD")
     inst.write(":WAV:BYTEORDER LSBFIRST")
     inst.write(":WAV:POINTS:MODE NORMAL")
-    inst.write(f":WAV:POINTS {POINTS_PER_SWEEP}")
+    inst.write(f":WAV:POINTS {args.min_record_length}")
 
     err = inst.query("SYST:ERR?").strip()
     print(
-        f"[DSOX1204G] Timebase {TIMEBASE_RANGE_S * 1e3:.3f} ms, trigger CHAN2 "
-        f"rising @ {TRIGGER_LEVEL_V:.3f} V, High-Res, {POINTS_PER_SWEEP} pts/sweep. "
-        f"CHAN1 autoscaled to {ch1_scale * 1e3:.2f} mV/div, {ch1_offset * 1e3:.2f} mV offset. "
-        f"SYST:ERR? -> {err}"
+        f"[Scope] {args.time_per_record_s * 1e3:.3f} ms/record, {args.min_record_length} pts, "
+        f"trigger {args.trigger_source} {args.trigger_slope} @ {args.trigger_level_v:.3f} V, "
+        f"acquisition={args.acquisition_type}. SYST:ERR? -> {err}"
     )
 
 
-def acquire_single_sweep(inst):
-    """Arm a single trigger, wait for it, digitize CHAN1+CHAN2 together, and
-    return {ch: (t, v)} for both channels from this one sweep."""
-    inst.write(":DIGITIZE CHAN1,CHAN2")  # blocks until acquisition completes
+def acquire_single_run(inst, channels):
+    """Arm a single trigger, wait for it, digitize the requested channels
+    together, and return {ch: (t, v)}."""
+    src = ",".join(f"CHAN{ch}" for ch in channels)
+    inst.write(f":DIGITIZE {src}")  # blocks until acquisition completes
 
     results = {}
-    for ch in (1, 2):
+    for ch in channels:
         inst.write(f":WAV:SOURCE CHAN{ch}")
         preamble = inst.query(":WAV:PREAMBLE?").strip().split(",")
         xincrement = float(preamble[4])
@@ -192,112 +316,117 @@ def acquire_single_sweep(inst):
 
 
 def main():
+    args = parse_args()
+
     os.makedirs(CSV_DIR, exist_ok=True)
-    os.makedirs(PNG_DIR, exist_ok=True)
+
+    channels = []
+    if args.ch1_enabled:
+        channels.append(1)
+    if args.ch2_enabled:
+        channels.append(2)
+    if not channels:
+        raise SystemExit("At least one of --ch1-enabled/--ch2-enabled must be set.")
 
     rm = pyvisa.ResourceManager()
-    scope = rm.open_resource(SCOPE_ADDR)
+    scope = rm.open_resource(args.scope_addr)
     scope.timeout = TIMEOUT_MS
-    awg = rm.open_resource(AWG_ADDR)
+    awg = rm.open_resource(args.awg_addr)
     awg.timeout = TIMEOUT_MS
 
-    print("[DSOX1204G] IDN:", scope.query("*IDN?").strip())
-    print("[33220A] IDN:", awg.query("*IDN?").strip())
+    print("[Scope] IDN:", scope.query("*IDN?").strip())
+    print("[AWG] IDN:", awg.query("*IDN?").strip())
 
-    setup_awg(awg)
-    setup_scope(scope)
+    setup_awg(awg, args)
+    setup_scope(scope, args)
 
     t_ref = None
-    sum_v1 = None
-    sum_v2 = None
+    traces = {ch: [] for ch in channels}  # traces[ch][run] -> v array
+    run_max = []   # per-run max of channel 1 ("Average Max" input)
+    run_min = []   # per-run min of channel 1 ("Average Minimum" input)
     n_captured = 0
 
-    print(f"\nCapturing {NUM_AVERAGES} triggered sweeps and averaging...\n")
+    print(f"\nCapturing {args.runs} triggered runs...\n")
 
     try:
-        for i in range(NUM_AVERAGES):
-            data = acquire_single_sweep(scope)
+        for i in range(args.runs):
+            data = acquire_single_run(scope, channels)
             t1, v1 = data[1]
-            t2, v2 = data[2]
 
             if t_ref is None:
-                n = len(v1)
-                t_ref = t1[:n]
-                sum_v1 = np.zeros(n)
-                sum_v2 = np.zeros(n)
+                t_ref = t1
 
-            n = min(len(v1), len(v2), len(sum_v1))
-            sum_v1[:n] += v1[:n]
-            sum_v2[:n] += v2[:n]
+            n = len(t_ref)
+            for ch in channels:
+                t_ch, v_ch = data[ch]
+                traces[ch].append(v_ch[:n])
+
+            run_max.append(float(np.max(v1)))
+            run_min.append(float(np.min(v1)))
             n_captured += 1
 
-            if (i + 1) % 25 == 0 or (i + 1) == NUM_AVERAGES:
-                print(f"\r  {i + 1}/{NUM_AVERAGES} sweeps captured", end="", flush=True)
+            if (i + 1) % 10 == 0 or (i + 1) == args.runs:
+                print(f"\r  Run {i + 1}/{args.runs} captured", end="", flush=True)
     except KeyboardInterrupt:
-        print(f"\nStopped early after {n_captured} sweeps - averaging what we have.")
+        print(f"\nStopped early after {n_captured} runs - processing what we have.")
     finally:
-        try:
-            awg.write("OUTP OFF")
-        except Exception:
-            pass
+        if args.change_pulse:
+            # Only turn the AWG output back off if we're the ones who turned
+            # it on; --no-change-pulse means "leave it as I found it."
+            try:
+                awg.write("OUTP OFF")
+            except Exception:
+                pass
         scope.write(":RUN")  # restore normal continuous display
         scope.close()
         awg.close()
         rm.close()
 
     if n_captured == 0:
-        print("No sweeps captured - nothing to plot.")
+        print("No runs captured - nothing to process.")
         return
 
-    avg_v1 = sum_v1 / n_captured  # averaged detector output
-    avg_v2 = sum_v2 / n_captured  # averaged sawtooth (V_tune) - raw, for reference
+    run_max = np.array(run_max[:n_captured])
+    run_min = np.array(run_min[:n_captured])
+    run_diff_mv = (run_max - run_min) * 1e3
 
-    # The ramp is driven linearly in time by design, but per-sample scope
-    # noise on CHAN2 is comparable in size to the ramp's tiny per-sample
-    # voltage step, so avg_v2 itself is not perfectly monotonic. Using it
-    # directly as the frequency axis makes freq_ghz wiggle backward from one
-    # sample to the next, which shows up as zig-zag spikes when plotted
-    # against the (also noisy) detector trace. Fit a line to avg_v2 vs. time
-    # instead - since the ramp is linear by construction - to get a smooth,
-    # strictly monotonic voltage (and therefore frequency) axis.
-    ramp_slope, ramp_intercept = np.polyfit(t_ref, avg_v2, 1)
-    v_tune_fit = ramp_slope * t_ref + ramp_intercept
-    freq_ghz = V_TO_F_SLOPE_GHZ_PER_V * v_tune_fit + V_TO_F_INTERCEPT_GHZ
+    # "Average Max 2" / "Average Minimum 2" / "Difference (mV)" / "Percent Diff":
+    # the per-run max/min values, averaged across all runs.
+    avg_max_2 = float(np.mean(run_max))
+    avg_min_2 = float(np.mean(run_min))
+    difference_mv = (avg_max_2 - avg_min_2) * 1e3
+    # abs() so Percent Diff stays a positive fraction of the signal's scale
+    # even if the detector's baseline (avg_max_2) is negative-going.
+    percent_diff = 100.0 * difference_mv / abs(avg_max_2 * 1e3) if avg_max_2 else float("nan")
 
-    # Deviation from the mean, as a percentage of the mean, so the dip shows
-    # up as a negative excursion around zero regardless of absolute signal level.
-    mean_v1 = np.mean(avg_v1)
-    # Divide by abs(mean_v1), not mean_v1, so a dip still reads as a
-    # negative percentage even if the detector's mean level is negative.
-    dev_pct_v1 = 100 * (avg_v1 - mean_v1) / abs(mean_v1) if mean_v1 else np.zeros_like(avg_v1)
+    # N reflects the actual number of runs captured (may be less than
+    # --runs if stopped early), so the filename alone says what's in it.
+    base_name = output_base_name(n_captured)
+    output_csv = os.path.join(CSV_DIR, f"{base_name}_summary.csv")
+    output_traces_csv = os.path.join(CSV_DIR, f"{base_name}.csv")
 
-    # Save raw + percent-deviation-from-mean averaged data for the lab report.
-    with open(OUTPUT_CSV, "w", newline="") as f:
+    with open(output_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["time_s", "v_tune_V", "freq_GHz", "detector_V", "detector_pct_dev_from_mean"])
-        for t, vt, fq, vd, dv in zip(t_ref, avg_v2, freq_ghz, avg_v1, dev_pct_v1):
-            writer.writerow([t, vt, fq, vd, dv])
-    print(f"\nSaved averaged data to {OUTPUT_CSV}")
+        writer.writerow(["run_index", "ch1_max_V", "ch1_min_V", "diff_mV"])
+        for i, (mx, mn, df) in enumerate(zip(run_max, run_min, run_diff_mv)):
+            writer.writerow([i, mx, mn, df])
+    print(f"\n\nSaved per-run stats to {output_csv}")
 
-    # Plot detector output's percent deviation from its mean vs. drive frequency - look for the resonance dip.
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(freq_ghz, dev_pct_v1, linewidth=1)
-    ax.axhline(0, color="black", linewidth=0.5, alpha=0.5)
-    ax.set_xlabel("Microwave drive frequency (GHz)")
-    ax.set_ylabel("Detector output, deviation from mean (%)")
-    ax.set_title(f"Detector response deviation from mean vs. drive frequency (N={n_captured} sweeps)")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(OUTPUT_PNG, dpi=150)
-    print(f"Saved plot to {OUTPUT_PNG}")
+    if args.save_traces:
+        with open(output_traces_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["run_index", "time_s"] + [f"ch{ch}_V" for ch in channels])
+            for i in range(n_captured):
+                for j, t in enumerate(t_ref):
+                    writer.writerow([i, t] + [traces[ch][i][j] for ch in channels])
+        print(f"Saved raw per-sample traces to {output_traces_csv}")
 
-    dip_idx = np.argmin(dev_pct_v1)
     print(
-        f"\nMean detector level: {mean_v1:.5f} V\n"
-        f"Deepest dip: {dev_pct_v1[dip_idx]:.2f}% below mean at {freq_ghz[dip_idx]:.4f} GHz"
+        f"\nAverage Max 2:  {avg_max_2:.5f} V\n"
+        f"Average Min 2:  {avg_min_2:.5f} V\n"
+        f"Difference:     {difference_mv:.3f} mV\n"
+        f"Percent Diff:   {percent_diff:.2f} %"
     )
-
-    plt.show()
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ Usage:
 
 import argparse
 import csv
+import datetime
 import os
 from collections import defaultdict
 
@@ -70,9 +71,17 @@ CSV_DIR = "csv_output"
 PNG_DIR = "png_output"
 
 DEFAULT_INPUT_CSV = os.path.join(CSV_DIR, "odmr_labview_replica_traces.csv")
-OUTPUT_CSV = os.path.join(CSV_DIR, "odmr_labview_voltage_freq.csv")
-OUTPUT_PNG = os.path.join(PNG_DIR, "odmr_labview_voltage_freq.png")
-OUTPUT_KEPT_VS_DISCARDED_PNG = os.path.join(PNG_DIR, "odmr_labview_voltage_freq_kept_vs_discarded.png")
+
+# Experiment condition label for output filenames - fixed for now (not yet a
+# CLI flag); update this if you run at a different field.
+FIELD_LABEL = "0Field"
+
+
+def output_base_name(n_sweeps):
+    """ODMR_Trace_<field>_N<sweeps>_<MMDDYY>_<HHMM>, e.g.
+    ODMR_Trace_0Field_N1000_091526_1627."""
+    timestamp = datetime.datetime.now().strftime("%m%d%y_%H%M")
+    return f"ODMR_Trace_{FIELD_LABEL}_N{n_sweeps}_{timestamp}"
 
 
 def parse_args():
@@ -160,7 +169,7 @@ def smooth_freq_axis(ch2_v):
     return V_TO_F_SLOPE_GHZ_PER_V * ch2_fit + V_TO_F_INTERCEPT_GHZ
 
 
-def plot_kept_vs_discarded(kept, discarded, n):
+def plot_kept_vs_discarded(kept, discarded, n, output_path):
     """Plot up to n raw CH1-vs-frequency traces each from kept and
     discarded sweeps, side by side, so a filter's effect can be inspected."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), sharex=True, sharey=True)
@@ -181,8 +190,8 @@ def plot_kept_vs_discarded(kept, discarded, n):
 
     ax1.set_ylabel("CH1 detector output (V)")
     fig.tight_layout()
-    fig.savefig(OUTPUT_KEPT_VS_DISCARDED_PNG, dpi=150)
-    print(f"Saved kept-vs-discarded diagnostic plot to {OUTPUT_KEPT_VS_DISCARDED_PNG}")
+    fig.savefig(output_path, dpi=150)
+    print(f"Saved kept-vs-discarded diagnostic plot to {output_path}")
 
 
 def main():
@@ -193,7 +202,6 @@ def main():
     n_loaded = len(sweeps)
     print(f"Loaded {n_loaded} sweeps from {args.input}")
 
-    output_csv, output_png = OUTPUT_CSV, OUTPUT_PNG
     discarded = {}
     if args.min_diff_mv is not None or args.max_jump_mv is not None:
         kept = {}
@@ -212,13 +220,16 @@ def main():
         )
         if not sweeps:
             raise SystemExit("No sweeps passed the filters - nothing to average.")
-        root, ext = os.path.splitext(OUTPUT_CSV)
-        output_csv = f"{root}_filtered{ext}"
-        root, ext = os.path.splitext(OUTPUT_PNG)
-        output_png = f"{root}_filtered{ext}"
+
+    # N reflects the actual number of sweeps used (post-filtering), so the
+    # filename alone tells you what went into the average.
+    base_name = output_base_name(len(sweeps))
+    output_csv = os.path.join(CSV_DIR, f"{base_name}.csv")
+    output_png = os.path.join(PNG_DIR, f"{base_name}.png")
+    output_kept_vs_discarded_png = os.path.join(PNG_DIR, f"{base_name}_kept_vs_discarded.png")
 
     if args.diagnostic_traces > 0 and discarded:
-        plot_kept_vs_discarded(sweeps, discarded, args.diagnostic_traces)
+        plot_kept_vs_discarded(sweeps, discarded, args.diagnostic_traces, output_kept_vs_discarded_png)
 
     # Convert each sweep's tuning voltage to frequency via a linear fit
     # (see smooth_freq_axis), sorted ascending so interpolation is

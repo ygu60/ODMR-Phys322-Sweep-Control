@@ -7,3 +7,7 @@ odmr_averaged_sweep.png
 # MB to multiple GB - well past GitHub's 100 MB per-file limit. Keep these
 # as local-only archives, not git-tracked.
 csv_output/*traces*.csv
+
+# Archived old-run data (moved here manually) - multiple GB, local-only.
+csv_output/Old Runs/
+png_output/Old Runs/
