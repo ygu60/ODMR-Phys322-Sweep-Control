@@ -81,9 +81,14 @@ PNG_DIR = "png_output"
 
 DEFAULT_INPUT_CSV = os.path.join(CSV_DIR, "odmr_labview_replica_traces.csv")
 
-# Experiment condition label for output filenames - fixed for now (not yet a
-# CLI flag); update this if you run at a different field.
-FIELD_LABEL = "0Field"
+# Experiment condition label for output filenames/folders - fixed for now
+# (not yet a CLI flag); update this if you run at a different field.
+FIELD_LABEL = "0.900A"
+
+# Outputs go in csv_output/<FIELD_LABEL>/ and png_output/<FIELD_LABEL>/, so
+# different conditions don't mix in one flat folder.
+FIELD_CSV_DIR = os.path.join(CSV_DIR, FIELD_LABEL)
+FIELD_PNG_DIR = os.path.join(PNG_DIR, FIELD_LABEL)
 
 
 def output_base_name(n_sweeps):
@@ -253,8 +258,8 @@ def plot_kept_vs_discarded(kept, discarded, n, output_path):
 
 def main():
     args = parse_args()
-    os.makedirs(CSV_DIR, exist_ok=True)
-    os.makedirs(PNG_DIR, exist_ok=True)
+    os.makedirs(FIELD_CSV_DIR, exist_ok=True)
+    os.makedirs(FIELD_PNG_DIR, exist_ok=True)
     sweeps = load_sweeps(args.input)
     n_loaded = len(sweeps)
     print(f"Loaded {n_loaded} sweeps from {args.input}")
@@ -289,9 +294,9 @@ def main():
     # N reflects the actual number of sweeps used (post-filtering), so the
     # filename alone tells you what went into the average.
     base_name = output_base_name(len(sweeps))
-    output_csv = os.path.join(CSV_DIR, f"{base_name}.csv")
-    output_png = os.path.join(PNG_DIR, f"{base_name}.png")
-    output_kept_vs_discarded_png = os.path.join(PNG_DIR, f"{base_name}_kept_vs_discarded.png")
+    output_csv = os.path.join(FIELD_CSV_DIR, f"{base_name}.csv")
+    output_png = os.path.join(FIELD_PNG_DIR, f"{base_name}.png")
+    output_kept_vs_discarded_png = os.path.join(FIELD_PNG_DIR, f"{base_name}_kept_vs_discarded.png")
 
     if args.diagnostic_traces > 0 and discarded:
         plot_kept_vs_discarded(sweeps, discarded, args.diagnostic_traces, output_kept_vs_discarded_png)

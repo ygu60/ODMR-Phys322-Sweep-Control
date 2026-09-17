@@ -58,9 +58,13 @@ DEFAULT_AWG_ADDR = "GPIB0::5::INSTR"
 # --- Output folder ---
 CSV_DIR = "csv_output"
 
-# Experiment condition label for output filenames - fixed for now (not yet a
-# CLI flag); update this if you run at a different field.
-FIELD_LABEL = "0Field"
+# Experiment condition label for output filenames/folder - fixed for now
+# (not yet a CLI flag); update this if you run at a different field.
+FIELD_LABEL = "0.900A"
+
+# Outputs go in csv_output/<FIELD_LABEL>/, so different conditions don't mix
+# in one flat folder.
+FIELD_CSV_DIR = os.path.join(CSV_DIR, FIELD_LABEL)
 
 
 def output_base_name(n_runs):
@@ -318,7 +322,7 @@ def acquire_single_run(inst, channels):
 def main():
     args = parse_args()
 
-    os.makedirs(CSV_DIR, exist_ok=True)
+    os.makedirs(FIELD_CSV_DIR, exist_ok=True)
 
     channels = []
     if args.ch1_enabled:
@@ -402,8 +406,8 @@ def main():
     # N reflects the actual number of runs captured (may be less than
     # --runs if stopped early), so the filename alone says what's in it.
     base_name = output_base_name(n_captured)
-    output_csv = os.path.join(CSV_DIR, f"{base_name}_summary.csv")
-    output_traces_csv = os.path.join(CSV_DIR, f"{base_name}.csv")
+    output_csv = os.path.join(FIELD_CSV_DIR, f"{base_name}_summary.csv")
+    output_traces_csv = os.path.join(FIELD_CSV_DIR, f"{base_name}.csv")
 
     with open(output_csv, "w", newline="") as f:
         writer = csv.writer(f)
