@@ -41,7 +41,9 @@ Produces three figures:
   - The ridgeline overlay, all conditions stacked vertically on one axis
     with a per-condition offset and direct end-labels - a middle ground
     between the previous two, keeping the top-to-bottom progression visible
-    on a single axis without curves colliding.
+    on a single axis without curves colliding. Uses the full swept
+    frequency range but a narrow figure width, so every dip's depth-to-width
+    ratio reads larger without cropping any data out of view.
 
 Requires: pip install numpy matplotlib
 
@@ -90,9 +92,9 @@ def parse_args():
                    help="Number of grid columns (default: 5, giving 2 rows for 10 conditions).")
     p.add_argument("--feature-frac", type=float, default=0.2,
                    help="Fraction of each condition's own peak deviation from its median baseline "
-                        "used to detect that condition's feature region for the shared, cropped x-axis "
-                        "(default: 0.2). Lower = wider auto-detected region (more sensitive to noise "
-                        "in the shallowest conditions); higher = tighter crop.")
+                        "used to detect that condition's feature region for the grid plot's shared, "
+                        "cropped x-axis (default: 0.2). Lower = wider auto-detected region (more "
+                        "sensitive to noise in the shallowest conditions); higher = tighter crop.")
     return p.parse_args()
 
 
@@ -237,14 +239,22 @@ def plot_ridgeline_overlay(conditions, cmap, norm):
     a middle ground between the single overlay (everything on one baseline,
     hard to follow any one curve once >4 lines converge) and the grid
     (clearest per-condition shape, but loses the side-by-side stacking that
-    makes the progression across conditions easy to scan top-to-bottom)."""
+    makes the progression across conditions easy to scan top-to-bottom).
+
+    Uses the full swept frequency range (no data is cropped out) but a
+    narrow figure width, so the same dip is stretched over fewer horizontal
+    pixels - increasing its visual depth-to-width ratio - without hiding any
+    of the baseline on either side."""
     offset_step = 1.3 * max(np.max(c[3]) - np.min(c[3]) for c in conditions)
-    fig, ax = plt.subplots(figsize=(9, 6))
+    x_lo = min(np.min(c[2]) for c in conditions)
+    x_hi = max(np.max(c[2]) for c in conditions)
+
+    fig, ax = plt.subplots(figsize=(5.5, 7.5))
     for i, (value, label, freq, contrast) in enumerate(conditions):
         y_offset = i * offset_step
         ax.plot(freq, contrast + y_offset, linewidth=1.6, color=cmap(norm(value)), zorder=2)
         ax.axhline(y_offset, color=BASELINE, linewidth=0.8, zorder=0)
-        ax.text(freq[-1], y_offset, f"  {label}", va="center", ha="left",
+        ax.text(x_hi, y_offset, f"  {label}", va="center", ha="left",
                  fontsize=9, color="#52514e")
 
     ax.set_xlabel("Microwave drive frequency (GHz)")
@@ -258,8 +268,6 @@ def plot_ridgeline_overlay(conditions, cmap, norm):
 
     # Room for the direct end-labels, which sit just past the last data
     # point of every curve.
-    x_lo = min(np.min(c[2]) for c in conditions)
-    x_hi = max(np.max(c[2]) for c in conditions)
     ax.set_xlim(x_lo, x_hi + 0.12 * (x_hi - x_lo))
 
     fig.tight_layout()
