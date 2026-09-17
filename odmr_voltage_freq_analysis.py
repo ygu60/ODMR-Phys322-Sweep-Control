@@ -105,7 +105,7 @@ def parse_args():
     p.add_argument("--despike-threshold-mv", type=float, default=15.0,
                    help="A sample is replaced by its local rolling-median value if it deviates from that "
                         "median by more than this (mV) (default: 15).")
-    p.add_argument("--diagnostic-traces", type=int, default=10,
+    p.add_argument("--diagnostic-traces", type=int, default=100,
                    help="When --min-diff-mv/--max-jump-mv filter out sweeps, plot this many kept and "
                         "this many discarded raw CH1-vs-frequency traces side by side for inspection "
                         "(0 disables this diagnostic plot).")

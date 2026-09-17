@@ -1,62 +1,183 @@
 # ODMR Averaged Sweep
 
-Data-collection script for an optically detected magnetic resonance (ODMR)
-measurement: sweep a microwave drive frequency across a resonance and look
-for the fractional dip in fluorescence, analogous to Zhang et al., *Am. J.
-Phys.* 86, 225 (2018), which reports an ~8% fluorescence dip on resonance.
+Data-collection and analysis pipeline for an optically detected magnetic
+resonance (ODMR) measurement: sweep a microwave drive frequency across a
+resonance and look for the fractional dip in fluorescence, analogous to
+Zhang et al., *Am. J. Phys.* 86, 225 (2018), which reports an ~8%
+fluorescence dip on resonance.
+
+## Pipeline overview
+
+```mermaid
+flowchart TD
+    subgraph HW["Physical hardware"]
+        AWG["Keysight 33220A<br/>function generator<br/>drives sawtooth V_tune -> VCO -> microwave"]
+        DET["PDA36A2<br/>photodetector/amplifier<br/>(fluorescence signal)"]
+        SCOPE["Keysight DSOX1204G<br/>oscilloscope<br/>CH1 = detector, CH2 = V_tune"]
+        AWG -- "V_tune ramp" --> SCOPE
+        AWG -- "drives VCO -> microwave -> sample" --> DET
+        DET -- "CH1 signal" --> SCOPE
+    end
+
+    subgraph ACQ["odmr_averaged_sweep.py (acquisition)"]
+        CONF["Configure AWG (waveform/freq/ampl/offset)<br/>and scope (coupling, headroom,<br/>CH2-synced trigger, NORMAL sweep)"]
+        LOOP["Loop N runs:<br/>DIGITIZE CHAN1,CHAN2<br/>-> per-run max/min stats"]
+        CONF --> LOOP
+    end
+
+    SCOPE == "live SCPI: IDN?, DIGITIZE,<br/>WAV:PREAMBLE?, WAV:DATA?" ==> LOOP
+
+    LOOP --> SUM["ODMR_Trace_&lt;field&gt;_N&lt;runs&gt;_&lt;timestamp&gt;_summary.csv<br/>(per-run max/min/diff)"]
+    LOOP --> RAW["ODMR_Trace_&lt;field&gt;_N&lt;runs&gt;_&lt;timestamp&gt;.csv<br/>(raw per-sample CH1/CH2 traces,<br/>only with --save-traces)"]
+
+    subgraph ANLZ["odmr_voltage_freq_analysis.py (analysis)"]
+        FILT["Filter sweeps:<br/>--min-diff-mv / --max-jump-mv<br/>-> kept vs. discarded"]
+        DESPK["Despike CH1<br/>(rolling-median outlier rejection<br/>within kept sweeps)"]
+        FIT["Fit CH2 vs. sample index -> smooth<br/>frequency axis via V_TO_F calibration"]
+        AVG["Interpolate every sweep onto a common<br/>frequency grid, average +/- SD,<br/>normalize to contrast percent / relative noise percent"]
+        FILT --> DESPK --> FIT --> AVG
+    end
+
+    RAW -- "--input" --> FILT
+    FILT -.-> DIAG["ODMR_Trace_..._kept_vs_discarded.png<br/>(diagnostic plot)"]
+    AVG --> OUTCSV["ODMR_Trace_&lt;field&gt;_N&lt;kept&gt;_&lt;timestamp&gt;.csv<br/>(averaged spectrum)"]
+    AVG --> OUTPNG["ODMR_Trace_&lt;field&gt;_N&lt;kept&gt;_&lt;timestamp&gt;.png<br/>(detector output vs. drive frequency)"]
+
+    DIAGTOOL["odmr_diagnose_ch2.py<br/>(read-only: live CH2 voltage +<br/>trigger config, no configuration changed)"]
+    SCOPE -.->|"manual, standalone check"| DIAGTOOL
+```
+
+`odmr_diagnose_ch2.py` sits outside the main pipeline - it's a standalone,
+read-only sanity check against the live scope, used to diagnose trigger/
+voltage-range problems without risking any acquisition run.
 
 ## Setup
 
 - **PDA36A2** photodetector/amplifier — fluorescence-proportional signal, read
   on scope **CHAN1**.
-- **Keysight 33220A** function generator — drives a rising sawtooth ramp
-  (`V_tune`) into a VCO to sweep the microwave frequency; also monitored on
-  scope **CHAN2**.
+- **Keysight 33220A** function generator — drives a sawtooth ramp (`V_tune`)
+  into a VCO to sweep the microwave frequency; also monitored on scope
+  **CHAN2**.
 - **Keysight DSOX1204G** oscilloscope — captures both channels together, one
-  triggered single-shot acquisition per sweep.
+  triggered single-shot acquisition (`:DIGITIZE`) per sweep.
 
-The scope triggers on the rising edge of CHAN2 at the start of each ramp, so
-every capture starts at the same phase of the sweep. A voltage-to-frequency
-calibration (`V_TO_F_SLOPE_GHZ_PER_V`, `V_TO_F_INTERCEPT_GHZ`), obtained from
-band-edge measurements, converts the sawtooth's tuning voltage into the
-corresponding microwave drive frequency.
+The scope triggers on CHAN2's rising edge, at a level set with real margin
+above the ramp's *actual measured* minimum (not derived from the commanded
+amplitude/offset - this 33220A's real CH2 output doesn't track those 1:1),
+so every capture starts at the same phase of the sweep. If you change the
+sawtooth's amplitude/offset, re-measure CH2 with `odmr_diagnose_ch2.py` and
+update `REAL_CH2_VMIN`/`REAL_CH2_VPP` in `odmr_averaged_sweep.py` (or pass
+`--trigger-level-v` explicitly), otherwise the trigger can land right in the
+ramp reset's noisiest region or miss the real waveform range entirely.
 
-## What the script does
+A voltage-to-frequency calibration (`V_TO_F_SLOPE_GHZ_PER_V`,
+`V_TO_F_INTERCEPT_GHZ`, defined in both scripts), obtained from band-edge
+measurements, converts the sawtooth's tuning voltage into the corresponding
+microwave drive frequency.
 
-1. Configures the 33220A to output the sawtooth sweep and the DSOX1204G to
-   trigger and digitize one sweep at a time.
-2. Repeats `NUM_AVERAGES` single-shot, triggered acquisitions of CHAN1 +
-   CHAN2, summing point-by-point as it goes (averaging beats down noise on
-   the detector signal, which is otherwise too small/noisy to see a clean
-   dip in a single sweep).
-3. Fits a line to the averaged sawtooth (CHAN2) vs. time — the ramp is linear
-   by design, and fitting removes residual per-sample scope noise so the
-   derived frequency axis is smooth and strictly monotonic — then converts it
-   to drive frequency via the calibration constants.
-4. Expresses the averaged detector trace as deviation from its own mean, so
-   the resonance shows up as a negative excursion around zero.
-5. Saves the averaged data to CSV and a plot (detector deviation vs. drive
-   frequency) to PNG, and prints the frequency and depth of the deepest dip.
-6. Restores the scope to normal continuous-run display when done (including
-   on Ctrl-C, which stops early and still averages/plots whatever was
-   captured).
+## Scripts
 
-## Usage
+See the [Pipeline overview](#pipeline-overview) diagram above for how these
+fit together.
+
+### 1. `odmr_averaged_sweep.py` — acquisition
+
+Configures the AWG and scope, then loops `--runs` triggered single-shot
+acquisitions of CHAN1 (+ CHAN2), recording each run's max/min and (with
+`--save-traces`) every raw sample.
 
 ```
-pip install pyvisa pyvisa-py numpy matplotlib
-python odmr_averaged_sweep.py
+pip install pyvisa pyvisa-py numpy
+python odmr_averaged_sweep.py --runs 1000 --waveform ramp --ampl-vpp 1.5 --offset-v 4.0 --save-traces
 ```
 
-Update `SCOPE_ADDR` / `AWG_ADDR` at the top of the script for your VISA
-resource strings, and the sawtooth/calibration constants if the sweep range
-or setup changes.
+Notable flags (run `--help` for the full list, grouped by instrument
+address / function generator / scope channels / acquisition-trigger):
+
+- `--ch1-headroom` (default 4.0) widens CH1's autoscaled range after
+  autoscaling, so a rare large transient records at its true amplitude
+  instead of clipping.
+- `--trigger-source`/`--trigger-level-v`/`--trigger-slope` default to a
+  CHAN2-synced rising edge with margin above the real measured minimum (see
+  Setup above).
+- `--min-record-length` (default 10000) and `--time-per-record-s` (default:
+  derived from `--freq-hz` to capture slightly less than one ramp period)
+  control per-sweep resolution.
+- `--no-change-pulse` leaves the AWG's current output untouched instead of
+  reconfiguring it at startup.
+- Ctrl-C stops early and still saves whatever was captured.
+
+Update `DEFAULT_SCOPE_ADDR`/`DEFAULT_AWG_ADDR` at the top of the script (or
+pass `--scope-addr`/`--awg-addr`) for your VISA resource strings.
+
+### 2. `odmr_voltage_freq_analysis.py` — analysis
+
+Reads a raw-traces CSV from step 1 (`--input`), optionally filters out bad
+sweeps, despikes CH1, converts each sweep's CH2 voltage to frequency via a
+linear fit (not the raw per-sample value - see the script's docstring for
+why), interpolates every sweep onto a common frequency grid, and averages.
+
+```
+pip install numpy matplotlib
+python odmr_voltage_freq_analysis.py --input "csv_output/ODMR_Trace_0A_N1000_091526_1627.csv"
+```
+
+Notable flags:
+
+- `--min-diff-mv` / `--max-jump-mv` filter out sweeps with too small a
+  max-min range, or an irregular single-sample spike, respectively.
+  `--diagnostic-traces` plots a sample of kept vs. discarded sweeps so a
+  filter's effect can be inspected rather than taken on faith.
+- `--despike-window`/`--despike-threshold-mv` control the rolling-median
+  outlier filter applied within kept sweeps (distinct from `--max-jump-mv`,
+  which rejects a whole sweep).
+- `--normalize-per-run` rescales each sweep to its own mean before
+  averaging, to cancel sweep-to-sweep gain/offset drift (off by default -
+  see the script's docstring for a caveat on when this helps vs. distorts).
+- `--grid-points` sets the common frequency grid's resolution.
+
+The `--input` default currently points at a filename from an older naming
+convention and won't exist - always pass `--input` explicitly.
+
+### 3. `odmr_diagnose_ch2.py` — standalone diagnostic
+
+Read-only: connects to the scope and prints CH2's live measured voltage
+(Vpp/Vmax/Vmin/Vavg), coupling, and the currently configured trigger
+settings, without changing anything. Useful for re-measuring CH2's real
+range after changing the sawtooth's amplitude/offset, or for debugging a
+scope trigger stuck on "Auto" (not finding a valid edge).
+
+```
+python odmr_diagnose_ch2.py
+```
 
 ## Output
 
-- `odmr_averaged_sweep.csv` — `time_s, v_tune_V, freq_GHz, detector_V,
-  detector_V_dev_from_mean` for every point in the averaged trace.
-- `odmr_averaged_sweep.png` — detector deviation-from-mean vs. drive
-  frequency, i.e. the ODMR sweep plot.
+Both scripts write to `csv_output/` (and `odmr_voltage_freq_analysis.py`
+also to `png_output/`), named
+`ODMR_Trace_<field>_N<n>_<MMDDYY>_<HHMM>[.csv|.png]`, where `<field>` is a
+`FIELD_LABEL` constant in each script's source (edit it before a run at a
+different experiment condition) and `<n>` is the actual number of
+runs/sweeps used - so every output file's name says what's in it without
+manual renaming.
 
-Both are git-ignored since they're per-run measurement data, not source.
+- **Acquisition** (`odmr_averaged_sweep.py`):
+  - `..._summary.csv` — `run_index, ch1_max_V, ch1_min_V, diff_mV` per run.
+  - `....csv` (with `--save-traces`) — `run_index, time_s, ch1_V, ch2_V` for
+    every sample of every run; this is what `odmr_voltage_freq_analysis.py`
+    takes as `--input`.
+- **Analysis** (`odmr_voltage_freq_analysis.py`):
+  - `....csv` — `freq_GHz, detector_V_avg, detector_V_sd, contrast_pct,
+    relative_noise_pct` for every point on the common frequency grid.
+  - `....png` — averaged detector output vs. drive frequency, with a ± SD
+    band.
+  - `..._kept_vs_discarded.png` — diagnostic plot of sample kept vs.
+    discarded raw traces (only produced when a filter actually excludes
+    sweeps).
+
+Raw per-sample traces routinely reach hundreds of MB to multiple GB (well
+past GitHub's 100 MB file limit) - `.gitignore` excludes anything matching
+`csv_output/*traces*.csv` and any `Old Runs/` archive folder, but the current
+`ODMR_Trace_*` naming can't distinguish a huge raw-traces file from a small
+analysis output by name alone, so double-check before `git add`-ing a large
+capture.
