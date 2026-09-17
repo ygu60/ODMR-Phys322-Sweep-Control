@@ -25,7 +25,7 @@ numeric value used for sorting/coloring - e.g. "0.300A" -> 0.3). Within each
 subfolder, if multiple analysis-output spectra exist (e.g. from re-running
 the analysis), picks the one with the largest N (most kept sweeps).
 
-Produces two figures:
+Produces three figures:
   - A grid of small multiples (2 rows x 5 columns for the 10-condition case),
     one condition per panel, sharing one y-scale so the shrinking dip depth
     reads directly from panel to panel - past ~4 converging series on one
@@ -34,10 +34,14 @@ Produces two figures:
     union of each condition's own feature region (auto-detected, not
     hardcoded), not the full swept range, since most of every sweep is flat
     baseline that just wastes width in a small panel.
-  - The original single-axis overlay, all conditions on one shared frequency
-    scale with a colorbar - useful for comparing absolute frequency
-    alignment across conditions, which the grid's per-panel framing doesn't
-    show as directly.
+  - The single-axis overlay, all conditions on one shared frequency scale
+    with a colorbar - useful for comparing absolute frequency alignment
+    across conditions, which the grid's per-panel framing doesn't show as
+    directly.
+  - The ridgeline overlay, all conditions stacked vertically on one axis
+    with a per-condition offset and direct end-labels - a middle ground
+    between the previous two, keeping the top-to-bottom progression visible
+    on a single axis without curves colliding.
 
 Requires: pip install numpy matplotlib
 
@@ -226,6 +230,42 @@ def plot_single_overlay(conditions, cmap, norm, unit):
     return fig
 
 
+def plot_ridgeline_overlay(conditions, cmap, norm):
+    """All conditions on one axis, stacked vertically (lowest condition at
+    bottom, highest at top) by a fixed offset so curves don't visually
+    overlap, each on its own dashed zero-baseline with a direct end-label -
+    a middle ground between the single overlay (everything on one baseline,
+    hard to follow any one curve once >4 lines converge) and the grid
+    (clearest per-condition shape, but loses the side-by-side stacking that
+    makes the progression across conditions easy to scan top-to-bottom)."""
+    offset_step = 1.3 * max(np.max(c[3]) - np.min(c[3]) for c in conditions)
+    fig, ax = plt.subplots(figsize=(9, 6 + 0.35 * len(conditions)))
+    for i, (value, label, freq, contrast) in enumerate(conditions):
+        y_offset = i * offset_step
+        ax.plot(freq, contrast + y_offset, linewidth=1.6, color=cmap(norm(value)), zorder=2)
+        ax.axhline(y_offset, color=BASELINE, linewidth=0.8, zorder=0)
+        ax.text(freq[-1], y_offset, f"  {label}", va="center", ha="left",
+                 fontsize=9, color="#52514e")
+
+    ax.set_xlabel("Microwave drive frequency (GHz)")
+    ax.set_ylabel("Contrast vs. baseline max (%), offset per condition")
+    ax.set_title("ODMR contrast vs. drive frequency across conditions")
+    ax.set_yticks([])  # offset axis has no single shared scale; dashed lines mark each 0%
+    ax.grid(True, axis="x", color=GRIDLINE, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+
+    # Room for the direct end-labels, which sit just past the last data
+    # point of every curve.
+    x_lo = min(np.min(c[2]) for c in conditions)
+    x_hi = max(np.max(c[2]) for c in conditions)
+    ax.set_xlim(x_lo, x_hi + 0.12 * (x_hi - x_lo))
+
+    fig.tight_layout()
+    return fig
+
+
 def main():
     args = parse_args()
     os.makedirs(PNG_DIR, exist_ok=True)
@@ -274,7 +314,10 @@ def main():
     overlay_fig.savefig(overlay_path, dpi=200)
     print(f"Saved single-axis overlay plot to {overlay_path}")
 
-    plt.show()
+    ridgeline_fig = plot_ridgeline_overlay(conditions, cmap, norm)
+    ridgeline_path = os.path.join(PNG_DIR, f"odmr_overlay_ridgeline_{base_name}.png")
+    ridgeline_fig.savefig(ridgeline_path, dpi=200)
+    print(f"Saved ridgeline overlay plot to {ridgeline_path}")
 
 
 if __name__ == "__main__":
