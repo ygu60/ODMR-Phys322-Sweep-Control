@@ -8,44 +8,20 @@ fluorescence dip on resonance.
 
 ## Pipeline overview
 
+A compact version (`figures/pipeline_diagram.png`) is also kept alongside the
+source for direct use in reports/papers, where Mermaid markdown won't render.
+
 ```mermaid
-flowchart TD
-    subgraph HW["Physical hardware"]
-        AWG["Keysight 33220A<br/>function generator<br/>drives sawtooth V_tune -> VCO -> microwave"]
-        DET["PDA36A2<br/>photodetector/amplifier<br/>(fluorescence signal)"]
-        SCOPE["Keysight DSOX1204G<br/>oscilloscope<br/>CH1 = detector, CH2 = V_tune"]
-        AWG -- "V_tune ramp" --> SCOPE
-        AWG -- "drives VCO -> microwave -> sample" --> DET
-        DET -- "CH1 signal" --> SCOPE
-    end
-
-    subgraph ACQ["odmr_averaged_sweep.py (acquisition)"]
-        CONF["Configure AWG (waveform/freq/ampl/offset)<br/>and scope (coupling, headroom,<br/>CH2-synced trigger, NORMAL sweep)"]
-        LOOP["Loop N runs:<br/>DIGITIZE CHAN1,CHAN2<br/>-> per-run max/min stats"]
-        CONF --> LOOP
-    end
-
-    SCOPE == "live SCPI: IDN?, DIGITIZE,<br/>WAV:PREAMBLE?, WAV:DATA?" ==> LOOP
-
-    LOOP --> SUM["ODMR_Trace_&lt;field&gt;_N&lt;runs&gt;_&lt;timestamp&gt;_summary.csv<br/>(per-run max/min/diff)"]
-    LOOP --> RAW["ODMR_Trace_&lt;field&gt;_N&lt;runs&gt;_&lt;timestamp&gt;.csv<br/>(raw per-sample CH1/CH2 traces,<br/>only with --save-traces)"]
-
-    subgraph ANLZ["odmr_voltage_freq_analysis.py (analysis)"]
-        FILT["Filter sweeps:<br/>--min-diff-mv / --max-jump-mv<br/>-> kept vs. discarded"]
-        DESPK["Despike CH1<br/>(rolling-median outlier rejection<br/>within kept sweeps)"]
-        FIT["Fit CH2 vs. sample index -> smooth<br/>frequency axis via V_TO_F calibration"]
-        AVG["Interpolate every sweep onto a common<br/>frequency grid, average +/- SD,<br/>normalize to contrast percent / relative noise percent"]
-        FILT --> DESPK --> FIT --> AVG
-    end
-
-    RAW -- "--input" --> FILT
-    FILT -.-> DIAG["ODMR_Trace_..._kept_vs_discarded.png<br/>(diagnostic plot)"]
-    AVG --> OUTCSV["ODMR_Trace_&lt;field&gt;_N&lt;kept&gt;_&lt;timestamp&gt;.csv<br/>(averaged spectrum)"]
-    AVG --> OUTPNG["ODMR_Trace_&lt;field&gt;_N&lt;kept&gt;_&lt;timestamp&gt;.png<br/>(detector output vs. drive frequency)"]
-
-    DIAGTOOL["odmr_diagnose_ch2.py<br/>(read-only: live CH2 voltage +<br/>trigger config, no configuration changed)"]
-    SCOPE -.->|"manual, standalone check"| DIAGTOOL
+flowchart LR
+    AWG["33220A AWG<br/>sawtooth V_tune"] --> VCO["VCO / MW source"] --> SAMPLE["Sample"] --> DET["PDA36A2<br/>detector"] --> SCOPE
+    AWG --> SCOPE["DSOX1204G scope<br/>CH1 = detector, CH2 = V_tune"]
+    SCOPE --> ACQ["Triggered acquisition<br/>N sweeps, CH1+CH2"]
+    ACQ --> PROC["Filter + despike +<br/>V_tune-to-frequency +<br/>average"]
+    PROC --> OUT["Averaged ODMR<br/>spectrum"]
 ```
+
+See the scripts below for the implementation details (CLI flags, exact
+filenames, SCPI commands) each stage corresponds to.
 
 `odmr_diagnose_ch2.py` sits outside the main pipeline - it's a standalone,
 read-only sanity check against the live scope, used to diagnose trigger/
