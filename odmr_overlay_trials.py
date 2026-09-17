@@ -239,7 +239,7 @@ def plot_ridgeline_overlay(conditions, cmap, norm):
     (clearest per-condition shape, but loses the side-by-side stacking that
     makes the progression across conditions easy to scan top-to-bottom)."""
     offset_step = 1.3 * max(np.max(c[3]) - np.min(c[3]) for c in conditions)
-    fig, ax = plt.subplots(figsize=(9, 6 + 0.35 * len(conditions)))
+    fig, ax = plt.subplots(figsize=(9, 6))
     for i, (value, label, freq, contrast) in enumerate(conditions):
         y_offset = i * offset_step
         ax.plot(freq, contrast + y_offset, linewidth=1.6, color=cmap(norm(value)), zorder=2)
@@ -266,20 +266,20 @@ def plot_ridgeline_overlay(conditions, cmap, norm):
     return fig
 
 
-def main():
-    args = parse_args()
-    os.makedirs(PNG_DIR, exist_ok=True)
-
-    conditions = []  # (numeric_value, label, freq, contrast)
-    for name in sorted(os.listdir(args.base_dir)):
-        folder = os.path.join(args.base_dir, name)
+def load_conditions(base_dir, unit):
+    """Auto-discover one condition per immediate subfolder of base_dir,
+    returning a list of (numeric_value, label, freq, contrast) sorted by
+    numeric_value. See module docstring for the folder/naming convention."""
+    conditions = []
+    for name in sorted(os.listdir(base_dir)):
+        folder = os.path.join(base_dir, name)
         if not os.path.isdir(folder):
             continue
         csv_path = find_spectrum_csv(folder)
         if csv_path is None:
             print(f"Skipping {folder}: no analysis-output spectrum CSV found.")
             continue
-        numeric_str = name[: -len(args.unit)] if args.unit and name.endswith(args.unit) else name
+        numeric_str = name[: -len(unit)] if unit and name.endswith(unit) else name
         try:
             value = float(numeric_str)
         except ValueError:
@@ -289,9 +289,17 @@ def main():
         print(f"Loaded {name} from {csv_path} ({len(freq)} points)")
 
     if not conditions:
-        raise SystemExit(f"No conditions with a spectrum CSV found under {args.base_dir}.")
+        raise SystemExit(f"No conditions with a spectrum CSV found under {base_dir}.")
 
     conditions.sort(key=lambda c: c[0])
+    return conditions
+
+
+def main():
+    args = parse_args()
+    os.makedirs(PNG_DIR, exist_ok=True)
+
+    conditions = load_conditions(args.base_dir, args.unit)
     values = [c[0] for c in conditions]
     vmin, vmax = min(values), max(values)
     # Guard a single-condition or all-equal-value edge case (Normalize needs
