@@ -9,7 +9,16 @@ averaging: --min-diff-mv excludes sweeps whose overall CH1 max-min range is
 too small (probably no visible feature), while --max-jump-mv excludes
 sweeps with an irregular single-sample spike/glitch (a jump between
 adjacent samples larger than the threshold, as distinct from a broad
-max-min range). For each remaining sweep:
+max-min range). --max-jump-percentile is a physically/statistically
+motivated alternative to the fixed --max-jump-mv: at any reasonable sample
+density, a real ODMR feature is far too gradual to produce a fast
+single-sample jump (a Lorentzian dip's steepest possible per-sample jump
+works out to well under the detector's own noise floor), so the threshold
+can instead be derived from this dataset's own per-sample jump distribution
+(a percentile rank) rather than a fixed mV number picked by eyeballing one
+past capture's histogram - see compute_adaptive_jump_threshold_mv() for why
+percentile rank, specifically, rather than median +/- k*sigma. For each
+remaining sweep:
 
   1. Fit CH2 (VCO tuning voltage) to a straight line vs. sample index, then
      convert that fit - not the raw per-sample CH2 value - to frequency:
@@ -94,7 +103,24 @@ def parse_args():
     p.add_argument("--max-jump-mv", type=float, default=30,
                    help="Exclude sweeps with a single-sample-to-sample CH1 jump larger than this (mV) - "
                         "filters out irregular spiking/glitches, as distinct from --min-diff-mv's broad "
-                        "max-min range. Unset: no spike filtering.")
+                        "max-min range. Unset: no spike filtering. Ignored if --max-jump-percentile is set.")
+    p.add_argument("--max-jump-percentile", type=float, default=None,
+                   help="Alternative to --max-jump-mv: instead of a fixed mV value, set the threshold to "
+                        "this percentile (try 99.9, not 99.5 - see below) of every per-sample jump "
+                        "observed across this dataset. A real ODMR feature is far too gradual, at any "
+                        "reasonable sample density, to ever produce a fast single-sample jump - so any "
+                        "threshold safely above the ordinary noise floor can't mistake real signal for a "
+                        "glitch. Percentile rank (not median +/- sigma) is used because this detector's "
+                        "signal is heavily ADC-quantized - most jumps repeat the exact same few values, "
+                        "which collapses median/MAD-based statistics to 0; percentile rank handles that "
+                        "fine since it doesn't care how much mass sits at any one repeated value. Needs a "
+                        "high percentile (99.9+, not 99.5): each sweep's WORST jump is a max over "
+                        "thousands of samples, so it will almost always exceed the population's "
+                        "99.5th-percentile value by chance alone even with no real glitch (an extreme-value "
+                        "statistics effect) - 99.9 empirically reproduces the same kept/discarded split as "
+                        "a hand-picked --max-jump-mv on real data, 99.5 rejects nearly everything. Adapts "
+                        "automatically if the vertical range/headroom/gain changes between captures, "
+                        "unlike a fixed mV number. Unset: use the fixed --max-jump-mv instead.")
     p.add_argument("--normalize-per-run", action=argparse.BooleanOptionalAction, default=False,
                    help="Rescale each sweep to its own mean before averaging, so sweep-to-sweep "
                         "gain/offset drift (e.g. laser RIN) doesn't bias the average (default: on).")
@@ -134,6 +160,37 @@ def load_sweeps(path):
             ch2.append(float(row[ch2_col]))
 
     return {run_idx: (np.array(ch1), np.array(ch2)) for run_idx, (ch1, ch2) in sweeps.items()}
+
+
+def compute_adaptive_jump_threshold_mv(sweeps, percentile):
+    """Derive a --max-jump-mv-equivalent threshold from this dataset's own
+    per-sample CH1 jump distribution: the given percentile of every
+    sample-to-sample jump observed across all loaded sweeps.
+
+    Percentile rank, not median +/- k*sigma: an earlier version of this
+    function used median + N * robust-sigma (MAD-based), the standard
+    "sigma-clipping" outlier rule (e.g. cosmic-ray rejection in astronomy).
+    On real data from this detector it collapsed to ~0, because the signal
+    is heavily ADC-quantized - most consecutive samples repeat the same
+    quantized value (~59% exactly-zero jumps in one real capture), and even
+    among the nonzero jumps, the bulk sit at a single value (one
+    quantization step). That degenerately pins the median (and then the
+    MAD of residuals from it) to 0 or to that one repeated value. Percentile
+    rank isn't affected by how much mass sits at any single repeated value,
+    so it doesn't collapse the same way, and empirically shows a clean gap
+    on real data (e.g. p99.5 ~ 6 mV, still within ordinary quantization
+    noise, vs. p99.9 ~ 71-160 mV, deep into glitch territory).
+
+    Use a high percentile (99.9+), not 99.5: --max-jump-mv filters on each
+    sweep's *worst* jump, which is a max over several thousand samples per
+    sweep. That max will almost always exceed the population's 99.5th
+    percentile by chance alone, real glitch or not (an extreme-value
+    statistics effect, not a flaw in the data) - empirically, 99.9
+    reproduces the same kept/discarded split as a hand-picked --max-jump-mv
+    on real data, while 99.5 rejects nearly every sweep.
+    Returns threshold_mv."""
+    all_jumps = np.concatenate([np.abs(np.diff(ch1_v)) for ch1_v, _ in sweeps.values()])
+    return np.percentile(all_jumps, percentile) * 1e3
 
 
 def despike(v, window, threshold_mv):
@@ -201,6 +258,14 @@ def main():
     sweeps = load_sweeps(args.input)
     n_loaded = len(sweeps)
     print(f"Loaded {n_loaded} sweeps from {args.input}")
+
+    if args.max_jump_percentile is not None:
+        threshold_mv = compute_adaptive_jump_threshold_mv(sweeps, args.max_jump_percentile)
+        args.max_jump_mv = threshold_mv
+        print(
+            f"Adaptive max-jump threshold from this dataset's own per-sample jump distribution: "
+            f"p{args.max_jump_percentile:g} = {threshold_mv:.3f} mV"
+        )
 
     discarded = {}
     if args.min_diff_mv is not None or args.max_jump_mv is not None:
